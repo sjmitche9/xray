@@ -1,0 +1,10 @@
+pandas
+numpy
+plotly
+python-dotenv
+ray[default]
+optuna
+datasets
+transformers
+pillow
+# torch
