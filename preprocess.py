@@ -13,9 +13,6 @@ MAX_LENGTH = 256
 MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
 OUTPUT_PATH = "processed/iu_xray_hf"
 
-from transformers import AutoTokenizer
-from PIL import Image
-import numpy as np
 
 def preprocess(example):
     try:

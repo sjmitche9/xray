@@ -7,4 +7,9 @@ optuna
 datasets
 transformers
 pillow
-# torch
+nltk
+torch torchvision # for GPU use
+wandb
+evaluate
+rouge-score
+absl-py
