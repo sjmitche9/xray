@@ -1,6 +1,6 @@
 # evaluate.py
 import torch
-from model import ImageToTextModel
+from baseline.model import ImageToTextModel
 from datasets import load_from_disk
 from transformers import AutoTokenizer
 import evaluate

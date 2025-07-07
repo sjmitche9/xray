@@ -5,7 +5,7 @@ python-dotenv
 ray[default]
 optuna
 datasets
-transformers
+transformers[torch]
 pillow
 nltk
 torch torchvision # for GPU use
@@ -13,3 +13,4 @@ wandb
 evaluate
 rouge-score
 absl-py
+h5py

@@ -1,0 +1,32 @@
+# config/config.yaml
+
+# Model & Tokenizer
+model_name: emilyalsentzer/Bio_ClinicalBERT
+vocab_size: 30522  # You can override with tokenizer.vocab_size
+
+# Training
+num_train_epochs: 2
+train_batch_size: 16
+eval_batch_size: 16
+fp16: true
+gradient_accumulation_steps: 8
+eval_accumulation_steps: 8
+gradient_checkpointing: true
+
+eval_strategy: "epoch"
+save_strategy: "epoch"
+logging_strategy: "epoch"
+save_total_limit: 1
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false
+early_stopping_patience: 3
+
+# Dataset paths
+train_dataset_path: processed/train
+val_dataset_path: processed/val
+
+# Output & Logging
+output_dir: checkpoints/
+run_name: iu-xray-baseline
+report_to: wandb
