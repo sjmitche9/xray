@@ -30,3 +30,8 @@ val_dataset_path: processed/val
 output_dir: checkpoints/
 run_name: iu-xray-baseline
 report_to: wandb
+
+ROOT_DIR: "Z:/mimic-cxr-jpg/files"
+METADATA_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-metadata.csv"
+SPLIT_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-split.csv"
+OUTPUT_PATH: "processed/mimic_cxr_hf_subset"
