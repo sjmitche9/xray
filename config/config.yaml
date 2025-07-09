@@ -1,37 +1,44 @@
-# config/config.yaml
+# --- config/config.yaml ---
 
-# Model & Tokenizer
-model_name: emilyalsentzer/Bio_ClinicalBERT
-vocab_size: 30522  # You can override with tokenizer.vocab_size
+# dataset config
+DATASET:
+  ROOT_DIR: "Z:/mimic-cxr-jpg/files"
+  METADATA_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-metadata.csv"
+  SPLIT_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-split.csv"
+  OUTPUT_PATH: "data/processed_dataset/subset" # use /subset for testing and debugging (100 images)
+  IMAGE_SIZE: 256
+  MAX_REPORT_LENGTH: 128
+  LIMIT_SAMPLES: 1000  # set to null or a number like 100 for quick tests
+  NUM_CPUS: 14
 
-# Training
-num_train_epochs: 2
-train_batch_size: 16
-eval_batch_size: 16
-fp16: true
-gradient_accumulation_steps: 8
-eval_accumulation_steps: 8
-gradient_checkpointing: true
+# model config
+MODEL:
+  DIFFUSION_CHECKPOINT: "checkpoints/diffusion.pt"
+  DIFFUSION_RESUME: true
+  TOKENIZER_NAME: "emilyalsentzer/Bio_ClinicalBERT"
+  LATENT_DIM: 8
+  LATENT_H: 32
+  LATENT_W: 32
+  VAE_CHECKPOINT: "checkpoints/vae.pt"
+  VAE_RESUME: true
 
-eval_strategy: "epoch"
-save_strategy: "epoch"
-logging_strategy: "epoch"
-save_total_limit: 1
-load_best_model_at_end: true
-metric_for_best_model: eval_loss
-greater_is_better: false
-early_stopping_patience: 3
+# training config
+TRAINING:
+  BATCH_SIZE: 4
+  EPOCHS: 50
+  LEARNING_RATE: 1e-4
+  CONTEXT_DROPOUT_PROB: 0.1
+  GUIDANCE_SCALE: 5.0
+  EARLY_STOP_PATIENCE: 5
 
-# Dataset paths
-train_dataset_path: processed/train
-val_dataset_path: processed/val
+  LR_SCHEDULER:
+    TYPE: "ReduceLROnPlateau"
+    PATIENCE: 3
+    FACTOR: 0.5
+    MIN_LR: 1e-6
 
-# Output & Logging
-output_dir: checkpoints/
-run_name: iu-xray-baseline
-report_to: wandb
-
-ROOT_DIR: "Z:/mimic-cxr-jpg/files"
-METADATA_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-metadata.csv"
-SPLIT_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-split.csv"
-OUTPUT_PATH: "processed/mimic_cxr_hf_subset"
+# logging
+WANDB:
+  PROJECT: "xray"
+  RUN_NAME_VAE: "train_vae"
+  RUN_NAME_DIFFUSION: "train_diffusion"
