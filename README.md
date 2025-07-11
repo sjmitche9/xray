@@ -7,17 +7,26 @@ This project explores the use of **conditional diffusion models** to generate me
 # diffusion_text_to_image: Starter scaffold for text-to-image radiology diffusion model
 
 # Directory structure suggestion
-# diffusion_text_to_image/
-# ├── config.yaml
-# ├── train.py
-# ├── generate.py
-# ├── preprocess_dataset.py
-# ├── models/
-# │   ├── text_encoder.py
-# │   ├── vae.py
-# │   └── unet.py
-# ├── scheduler/
-# │   └── ddpm_scheduler.py
-# ├── utils/
-# │   ├── dataset.py
-# │   └── wandb_logging.py
+.
+├── config/
+│   └── config.yaml
+├── models/
+│   ├── diffusion.py
+│   ├── text_encoder.py
+│   ├── text_to_latent.py
+│   ├── unet.py
+│   └── vae.py
+├── sampling/
+│   ├── sample_utils.py
+│   └── sampler.py
+├── scheduler/
+│   └── ddpm_scheduler.py
+├── generate.py
+├── make_latent_dataset.py
+├── preprocess_dataset.py
+├── train_diffusion_model.py
+├── train_text_to_latent.py
+├── train_vae_model.py
+├── README.md
+├── requirements.txt
+└── .gitignore

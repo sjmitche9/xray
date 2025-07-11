@@ -1,15 +1,25 @@
+
 import os
 import torch
 import yaml
 import wandb
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
 import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 from datasets import load_from_disk
 from models.vae import VAE
+from PIL import Image
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-# --- Load config ---
+
+def vae_loss_function(recon_x, x, mu, logvar, beta=1.0):
+    recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+    kl_div = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    return recon_loss + beta * kl_div, recon_loss, kl_div
+
 with open("config/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -17,120 +27,120 @@ output_path = config["DATASET"]["OUTPUT_PATH"]
 batch_size = config["TRAINING"]["BATCH_SIZE"]
 epochs = config["TRAINING"]["EPOCHS"]
 learning_rate = float(config["TRAINING"]["LEARNING_RATE"])
-vae_ckpt_path = config["MODEL"]["VAE_CHECKPOINT"]
-resume_vae = config["MODEL"].get("VAE_RESUME", False)
-early_stop_patience = config["TRAINING"].get("EARLY_STOP_PATIENCE", 5)
+beta_max = config["TRAINING"].get("BETA", 1.0)
+warmup_epochs = config["TRAINING"].get("WARMUP_EPOCHS", 10)
+early_stopping_patience = config["TRAINING"].get("EARLY_STOPPING_PATIENCE", 5)
+checkpoint_path = config["MODEL"].get("VAE_CHECKPOINT", "checkpoints/vae.pt")
 
-# --- Init Weights & Biases ---
-wandb.init(project=config["WANDB"]["PROJECT"], name=config["WANDB"]["RUN_NAME_VAE"], config=config)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Collate Function ---
-def collate_fn(batch):
-    return {
-        "image": torch.stack([torch.tensor(item["image"]) for item in batch]),
-        "input_ids": torch.tensor([item["input_ids"] for item in batch]),
-        "attention_mask": torch.tensor([item["attention_mask"] for item in batch]),
-    }
+vae = VAE().to(device)
+optimizer = Adam(vae.parameters(), lr=learning_rate)
 
-# --- VAE loss function ---
-def vae_loss(recon, x, mu, logvar):
-    recon_loss = F.mse_loss(recon, x, reduction="mean")
-    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
-    return recon_loss + kl
-
-# --- Model ---
-model = VAE(in_channels=1, latent_dim=config["MODEL"]["LATENT_DIM"])
-model = model.cuda() if torch.cuda.is_available() else model
-device = next(model.parameters()).device
-
-if resume_vae and os.path.exists(vae_ckpt_path):
-    model.load_state_dict(torch.load(vae_ckpt_path, map_location=device))
-
-optimizer = Adam(model.parameters(), lr=learning_rate)
-
-# --- Learning Rate Scheduler ---
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+scheduler = ReduceLROnPlateau(
     optimizer,
-    mode='min',
-    factor=float(config["TRAINING"]["LR_SCHEDULER"]["FACTOR"]),
-    patience=int(config["TRAINING"]["LR_SCHEDULER"]["PATIENCE"]),
-    min_lr=float(config["TRAINING"]["LR_SCHEDULER"]["MIN_LR"])
+    mode=config["TRAINING"].get("LR_SCHEDULER_MODE", "min"),
+    factor=config["TRAINING"].get("LR_SCHEDULER_FACTOR", 0.5),
+    patience=config["TRAINING"].get("LR_SCHEDULER_PATIENCE", 2)
 )
 
-# --- Load validation set once ---
-val_dataset = load_from_disk(os.path.join(output_path, "val"))
-val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=collate_fn)
 
-# --- Training loop ---
-chunk_dirs = sorted([d for d in os.listdir(output_path) if d.startswith("train_chunk_")])
+val_dataset = load_from_disk(os.path.join(output_path, "val"))
+val_dataset.set_format(type="torch", columns=["image"])
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+wandb.init(project="xray", name="train_vae", config=config)
 
 best_val_loss = float("inf")
-no_improvement_epochs = 0
+patience_counter = 0
 
 for epoch in range(epochs):
-    model.train()
-    print(f"Epoch {epoch+1}/{epochs}")
-    epoch_loss = 0.0
-    step = 0
+    beta = beta_max * min(1.0, epoch / warmup_epochs)
+    vae.train()
+    train_loss = train_recon = train_kl = total_batches = 0
 
-    for chunk_dir in chunk_dirs:
-        chunk_path = os.path.join(output_path, chunk_dir)
-        train_dataset = load_from_disk(chunk_path)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    chunk_id = 0
+    while True:
+        train_chunk_path = os.path.join(output_path, f"train_chunk_{chunk_id}")
+        if not os.path.exists(train_chunk_path):
+            break
 
-        for batch in tqdm(train_loader, desc=f"Training on {chunk_dir}"):
-            pixel_values = batch["image"].to(device)
+        train_dataset = load_from_disk(train_chunk_path)
+        train_dataset.set_format(type="torch", columns=["image"])
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-            recon, mu, logvar = model(pixel_values)
-            loss = vae_loss(recon, pixel_values, mu, logvar)
-
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} | Chunk {chunk_id}"):
+            x = batch["image"].to(device)
             optimizer.zero_grad()
+            recon, mu, logvar = vae(x)
+            loss, recon_loss, kl_loss = vae_loss_function(recon, x, mu, logvar, beta)
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
-            step += 1
-            wandb.log({"train/loss": loss.item()})
+            train_loss += loss.item()
+            train_recon += recon_loss.item()
+            train_kl += kl_loss.item()
+            total_batches += 1
 
-    avg_train_loss = epoch_loss / step
+        chunk_id += 1
 
-    # --- Validation ---
-    model.eval()
-    val_loss = 0.0
+    train_loss /= total_batches
+    train_recon /= total_batches
+    train_kl /= total_batches
+
+    vae.eval()
+    val_loss = val_recon = val_kl = 0
+    x_sample = recon_sample = None
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validating"):
-            pixel_values = batch["image"].to(device)
-
-            recon, mu, logvar = model(pixel_values)
-            loss = vae_loss(recon, pixel_values, mu, logvar)
+        for batch_idx, batch in enumerate(val_loader):
+            x = batch["image"].to(device)
+            recon, mu, logvar = vae(x)
+            loss, recon_loss, kl_loss = vae_loss_function(recon, x, mu, logvar, beta)
             val_loss += loss.item()
+            val_recon += recon_loss.item()
+            val_kl += kl_loss.item()
 
-    avg_val_loss = val_loss / len(val_loader)
+            if batch_idx == 0:
+                x_sample = x[:8].cpu()
+                recon_sample = recon[:8].clamp(0, 1).cpu()
+
+    val_loss /= len(val_loader)
+    val_recon /= len(val_loader)
+    val_kl /= len(val_loader)
+
+    images = []
+    if x_sample is not None and recon_sample is not None:
+        for i in range(len(x_sample)):
+            combined = torch.cat([x_sample[i], recon_sample[i]], dim=2)
+            images.append(wandb.Image(combined, caption=f"Sample {i}"))
+
+    print(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Recon: {train_recon:.4f} | KL: {train_kl:.4f}")
+    print(f"Validation Loss: {val_loss:.4f} | Recon: {val_recon:.4f} | KL: {val_kl:.4f}")
+
+    kl_ratio = train_kl / (train_recon + 1e-8)
+
+    scheduler.step(val_loss)
     wandb.log({
-        "val/loss": avg_val_loss,
-        "epoch": epoch + 1,
-        "train/avg_loss": avg_train_loss,
-        "best_val_loss": best_val_loss
+        "lr": optimizer.param_groups[0]["lr"],
+        "kl_ratio": kl_ratio,
+        "reconstructions": images,
+        "train_loss": train_loss,
+        "train_recon": train_recon,
+        "train_kl": train_kl,
+        "val_loss": val_loss,
+        "val_recon": val_recon,
+        "val_kl": val_kl,
+        "epoch": epoch + 1
     })
 
-    # --- Checkpointing ---
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        no_improvement_epochs = 0
-        torch.save(model.state_dict(), vae_ckpt_path)
-        wandb.log({
-            "best/epoch": epoch + 1,
-            "best/checkpoint_path": vae_ckpt_path,
-            "best/val_loss": best_val_loss
-        })
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        patience_counter = 0
+        torch.save(vae.state_dict(), checkpoint_path)
+        print(f"Model improved. Saved checkpoint to {checkpoint_path}")
     else:
-        no_improvement_epochs += 1
-
-    # Step scheduler on validation loss
-    scheduler.step(avg_val_loss)
-
-    print(f"Validation Loss after epoch {epoch+1}: {avg_val_loss:.4f} (best: {best_val_loss:.4f})")
-
-    if no_improvement_epochs >= early_stop_patience:
-        print(f"Early stopping at epoch {epoch+1} — no improvement in {no_improvement_epochs} epochs.")
-        break
+        patience_counter += 1
+        print(f"No improvement. Patience: {patience_counter}/{early_stopping_patience}")
+        if patience_counter >= early_stopping_patience:
+            print("Early stopping triggered.")
+            break

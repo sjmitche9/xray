@@ -1,163 +1,156 @@
 import os
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import load_from_disk
-import wandb
-import yaml
 from tqdm import tqdm
-from transformers import DataCollatorWithPadding
-
+import yaml
+import wandb
+from transformers import AutoTokenizer, AutoModel
 from models.vae import VAE
-from models.diffusion import DiffusionModel
-from torch.optim import Adam
+from models.latent_unet import LatentUNet
 
-# --- Load config ---
-with open("config/config.yaml", "r") as file:
-    config = yaml.safe_load(file)
+# --- Load config.yaml ---
+with open("config/config.yaml", "r") as f:
+    config = yaml.safe_load(f)
 
-DATA_CFG = config["DATASET"]
-MODEL_CFG = config["MODEL"]
-TRAIN_CFG = config["TRAINING"]
-WANDB_CFG = config["WANDB"]
+CONFIG = {
+    "vae_checkpoint": config["MODEL"]["VAE_CHECKPOINT"],
+    "val_dataset_path": os.path.join(config["DATASET"]["OUTPUT_PATH"], "val"),
+    "batch_size": config["TRAINING"]["BATCH_SIZE"],
+    "epochs": config["TRAINING"]["EPOCHS"],
+    "lr": float(config["TRAINING"]["LEARNING_RATE"]),
+    "latent_dim": config["MODEL"]["LATENT_DIM"],
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "run_name": config["WANDB"]["RUN_NAME_DIFFUSION"],
+    "project": config["WANDB"]["PROJECT"],
+    "checkpoint_path": config["MODEL"]["DIFFUSION_CHECKPOINT"],
+    "lr_scheduler_mode": config["TRAINING"].get("LR_SCHEDULER_MODE", "min"),
+    "lr_scheduler_factor": config["TRAINING"].get("LR_SCHEDULER_FACTOR", 0.5),
+    "lr_scheduler_patience": config["TRAINING"].get("LR_SCHEDULER_PATIENCE", 2),
+    "early_stopping_patience": config["TRAINING"].get("EARLY_STOPPING_PATIENCE", 5),
+    "output_path": config["DATASET"]["OUTPUT_PATH"]
+}
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# --- Init Weights & Biases ---
+wandb.init(project=CONFIG["project"], name=CONFIG["run_name"], config=config)
 
-# --- Init models ---
-vae = VAE(in_channels=1, latent_dim=MODEL_CFG["LATENT_DIM"]).to(device)
-if MODEL_CFG.get("VAE_RESUME") and os.path.exists(MODEL_CFG["VAE_CHECKPOINT"]):
-    vae.load_state_dict(torch.load(MODEL_CFG["VAE_CHECKPOINT"], map_location=device))
-vae.eval()  # VAE is frozen during diffusion training
-
-diffusion_model = DiffusionModel(config).to(device)
-if MODEL_CFG.get("DIFFUSION_RESUME") and os.path.exists(MODEL_CFG["DIFFUSION_CHECKPOINT"]):
-    diffusion_model.unet.load_state_dict(torch.load(MODEL_CFG["DIFFUSION_CHECKPOINT"], map_location=device))
-
-optimizer = Adam(diffusion_model.unet.parameters(), lr=float(TRAIN_CFG["LEARNING_RATE"]))
-
-# --- Init W&B ---
-wandb.init(project=WANDB_CFG["PROJECT"], name=WANDB_CFG["RUN_NAME_DIFFUSION"], config=config)
-
-# --- Initialize tokenizer and data collator ---
-tokenizer = diffusion_model.text_encoder.tokenizer
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+# --- Load tokenizer and text encoder ---
+tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+text_encoder = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT").to(CONFIG["device"])
 
 # --- Collate function ---
 def collate_fn(batch):
-    images = torch.stack([item["image"] for item in batch])
-    reports = [item["report"] for item in batch]
-    tokenized = data_collator([{
-        "input_ids": item["input_ids"],
-        "attention_mask": item["attention_mask"]
-    } for item in batch])
-    tokenized["image"] = images
-    tokenized["report"] = reports
-    return tokenized
+    return {
+        "image": torch.stack([torch.tensor(item["image"], dtype=torch.float32) for item in batch]),
+        "input_ids": torch.tensor([item["input_ids"] for item in batch]),
+        "attention_mask": torch.tensor([item["attention_mask"] for item in batch]),
+    }
 
-output_path = DATA_CFG["OUTPUT_PATH"]
-chunk_dirs = sorted([d for d in os.listdir(output_path) if d.startswith("train_chunk_")])
+# --- Load VAE ---
+vae = VAE(latent_dim=CONFIG["latent_dim"]).to(CONFIG["device"])
+vae.load_state_dict(torch.load(CONFIG["vae_checkpoint"], map_location=CONFIG["device"]))
+vae.eval()
 
-# Load validation set
-val_dataset = load_from_disk(os.path.join(output_path, "val"))
-val_dataset.set_format(type="torch", columns=["image", "input_ids", "attention_mask", "report"])
-val_loader = DataLoader(val_dataset, batch_size=TRAIN_CFG["BATCH_SIZE"], collate_fn=collate_fn)
+# --- Load validation set ---
+val_dataset = load_from_disk(CONFIG["val_dataset_path"])
+val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=collate_fn)
 
-diffusion_ckpt_path = MODEL_CFG["DIFFUSION_CHECKPOINT"]
-vae_ckpt_path = MODEL_CFG["VAE_CHECKPOINT"]
-best_val_loss = float("inf")
-no_improvement_epochs = 0
-early_stop_patience = TRAIN_CFG.get("EARLY_STOP_PATIENCE", 5)
-
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+# --- Initialize diffusion model ---
+model = LatentUNet(CONFIG["latent_dim"]).to(CONFIG["device"])
+optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["lr"])
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+scheduler = ReduceLROnPlateau(
     optimizer,
-    mode='min',
-    factor=float(TRAIN_CFG["LR_SCHEDULER"]["FACTOR"]),
-    patience=int(TRAIN_CFG["LR_SCHEDULER"]["PATIENCE"]),
-    min_lr=float(TRAIN_CFG["LR_SCHEDULER"]["MIN_LR"])
+    mode=CONFIG["lr_scheduler_mode"],
+    factor=CONFIG["lr_scheduler_factor"],
+    patience=CONFIG["lr_scheduler_patience"]
 )
 
-for epoch in range(TRAIN_CFG["EPOCHS"]):
-    diffusion_model.train()
-    total_loss = 0.0
-    step = 0
+# --- Training loop ---
+best_val_loss = float("inf")
+patience_counter = 0
 
-    for chunk_dir in chunk_dirs:
-        chunk_path = os.path.join(output_path, chunk_dir)
-        dataset = load_from_disk(chunk_path)
-        dataset.set_format(type="torch", columns=["image", "input_ids", "attention_mask", "report"])
-        train_loader = DataLoader(dataset, batch_size=TRAIN_CFG["BATCH_SIZE"], shuffle=True, collate_fn=collate_fn)
+for epoch in range(CONFIG["epochs"]):
+    model.train()
+    total_train_loss = 0.0
 
-        for batch in tqdm(train_loader, desc=f"Training on {chunk_dir}"):
-            images = batch["image"].to(device)
-            reports = batch["report"]
+    chunk_id = 0
+    while True:
+        chunk_path = os.path.join(CONFIG["output_path"], f"train_chunk_{chunk_id}")
+        if not os.path.exists(chunk_path):
+            break
+
+        train_dataset = load_from_disk(chunk_path)
+        train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn)
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} | Chunk {chunk_id}"):
+            image = batch["image"].to(CONFIG["device"])
+            input_ids = batch["input_ids"].to(CONFIG["device"])
+            attention_mask = batch["attention_mask"].to(CONFIG["device"])
 
             with torch.no_grad():
-                latents = vae.encode(images)
+                z = vae.encode(image)
+                text_emb = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0]
 
-            noise = torch.randn_like(latents)
-            pred_noise, target = diffusion_model(latents, noise, reports)
+            noise = torch.randn_like(z)
+            z_noisy = z + noise
 
-            loss = F.mse_loss(pred_noise, target)
+            pred_noise = model(z_noisy, text_emb)
+            loss = F.mse_loss(pred_noise, noise)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
-            step += 1
-            wandb.log({"train/loss": loss.item(), "train/epoch": epoch + 1, "train/step": step})
+            total_train_loss += loss.item()
+            wandb.log({"train/loss": loss.item()})
 
-    avg_train_loss = total_loss / step
+        chunk_id += 1
 
-    # --- Validation loop ---
-    diffusion_model.eval()
-    val_loss = 0.0
+    avg_train_loss = total_train_loss / max(1, chunk_id)
+    wandb.log({"train/avg_loss": avg_train_loss, "epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]})
+
+    # --- Validation ---
+    model.eval()
+    total_val_loss = 0.0
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validating"):
-            images = batch["image"].to(device)
-            reports = batch["report"]
-            latents = vae.encode(images)
-            noise = torch.randn_like(latents)
-            pred_noise, target = diffusion_model(latents, noise, reports)
-            loss = F.mse_loss(pred_noise, target)
-            val_loss += loss.item()
+        for batch in tqdm(val_loader, desc=f"Epoch {epoch+1} [Val]"):
+            image = batch["image"].to(CONFIG["device"])
+            input_ids = batch["input_ids"].to(CONFIG["device"])
+            attention_mask = batch["attention_mask"].to(CONFIG["device"])
 
-    avg_val_loss = val_loss / len(val_loader)
+            z = vae.encode(image)
+            text_emb = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0]
 
-    wandb.log({
-        "epoch": epoch + 1,
-        "train/avg_loss": avg_train_loss,
-        "val/loss": avg_val_loss,
-        "best_val_loss": best_val_loss
-    })
+            noise = torch.randn_like(z)
+            z_noisy = z + noise
+            pred_noise = model(z_noisy, text_emb)
 
-    # --- Sample image logging ---
-    with torch.no_grad():
-        sample_report = [batch["report"][0]]
-        z = diffusion_model.sample(sample_report, (1, MODEL_CFG["LATENT_DIM"], MODEL_CFG["LATENT_H"], MODEL_CFG["LATENT_W"]), device)
-        generated = vae.decode(z).cpu()
-        image = (generated[0].squeeze(0).numpy() * 255).astype("uint8")
-        wandb.log({"sample_image": [wandb.Image(image, caption=sample_report[0])]})
+            val_loss = F.mse_loss(pred_noise, noise)
+            total_val_loss += val_loss.item()
+            wandb.log({"val/loss": val_loss.item()})
 
-    # --- Checkpointing based on val loss ---
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        no_improvement_epochs = 0
-        torch.save(diffusion_model.unet.state_dict(), diffusion_ckpt_path)
-        torch.save(vae.state_dict(), vae_ckpt_path)
-        wandb.log({
-            "best/epoch": epoch + 1,
-            "best/val_loss": best_val_loss,
-            "best/diffusion_checkpoint": diffusion_ckpt_path,
-            "best/vae_checkpoint": vae_ckpt_path
-        })
-    else:
-        no_improvement_epochs += 1
-
+    avg_val_loss = total_val_loss / len(val_loader)
     scheduler.step(avg_val_loss)
 
-    print(f"Epoch {epoch + 1}: val_loss = {avg_val_loss:.4f} (best: {best_val_loss:.4f})")
+    wandb.log({
+        "val/avg_loss": avg_val_loss,
+        "best/val_loss": best_val_loss
+    })
 
-    if no_improvement_epochs >= early_stop_patience:
-        print(f"Early stopping at epoch {epoch + 1} after {no_improvement_epochs} epochs without improvement.")
-        break
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        patience_counter = 0
+        torch.save(model.state_dict(), CONFIG["checkpoint_path"])
+        wandb.log({
+            "best/epoch": epoch + 1,
+            "best/checkpoint_path": CONFIG["checkpoint_path"]
+        })
+    else:
+        patience_counter += 1
+        print(f"No improvement. Patience: {patience_counter}/{CONFIG['early_stopping_patience']}")
+        if patience_counter >= CONFIG["early_stopping_patience"]:
+            print("Early stopping triggered.")
+            break

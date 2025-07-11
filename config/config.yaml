@@ -5,30 +5,34 @@ DATASET:
   ROOT_DIR: "Z:/mimic-cxr-jpg/files"
   METADATA_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-metadata.csv"
   SPLIT_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-split.csv"
-  OUTPUT_PATH: "data/processed_dataset/subset" # use /subset for testing and debugging (100 images)
+  OUTPUT_PATH: "data/processed_dataset/fullset" # use /subset for testing and debugging (100 images)
   IMAGE_SIZE: 256
   MAX_REPORT_LENGTH: 128
   LIMIT_SAMPLES: 1000  # set to null or a number like 100 for quick tests
-  NUM_CPUS: 14
+  NUM_CPUS: 8 # keep this low when creating latent dataset
 
 # model config
 MODEL:
   DIFFUSION_CHECKPOINT: "checkpoints/diffusion.pt"
-  DIFFUSION_RESUME: true
+  DIFFUSION_RESUME: false
   TOKENIZER_NAME: "emilyalsentzer/Bio_ClinicalBERT"
-  LATENT_DIM: 8
+  LATENT_DIM: 64
   LATENT_H: 32
   LATENT_W: 32
   VAE_CHECKPOINT: "checkpoints/vae.pt"
-  VAE_RESUME: true
+  VAE_RESUME: false
+  TEXT_TO_LATENT_CHECKPOINT: "checkpoints/text_to_latent.pt"
+  TEXT_TO_LATENT_RESUME: false
 
 # training config
 TRAINING:
-  BATCH_SIZE: 4
+  BATCH_SIZE: 64
   EPOCHS: 50
   LEARNING_RATE: 1e-4
   CONTEXT_DROPOUT_PROB: 0.1
   GUIDANCE_SCALE: 5.0
+  BETA: 0.0001
+  WARMUP_EPOCHS: 10
   EARLY_STOP_PATIENCE: 5
 
   LR_SCHEDULER:
