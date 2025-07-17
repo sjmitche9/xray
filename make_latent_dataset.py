@@ -1,11 +1,10 @@
+# --- make_latent_dataset.py ---
 import os
 import torch
 import yaml
-from collections import defaultdict
 from datasets import load_from_disk, Dataset, DatasetDict
 from tqdm import tqdm
-from multiprocessing import Pool, set_start_method, cpu_count
-from functools import partial
+from multiprocessing import Pool, set_start_method
 
 # --- Load config ---
 with open("config/config.yaml", "r") as f:
@@ -13,7 +12,8 @@ with open("config/config.yaml", "r") as f:
 
 output_path = config["DATASET"]["OUTPUT_PATH"]
 latent_output_path = os.path.join(output_path, "latent")
-num_workers = config["DATASET"].get("NUM_CPUS", cpu_count())
+latent_dim = config["MODEL"]["LATENT_DIM"]
+num_workers = config["DATASET"].get("NUM_CPUS", 8)
 
 # Globals for worker processes
 tokenizer = None
@@ -26,14 +26,14 @@ def init_worker():
     global tokenizer, text_model, vae, device
     import torch
     from transformers import AutoTokenizer, AutoModel
-    from models.vae import VAE
+    from models.vae_enhanced import EnhancedVAE
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
     text_model = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT").to(device).eval()
 
-    vae = VAE().eval()
+    vae = EnhancedVAE(latent_dim=latent_dim).eval()
     vae.load_state_dict(torch.load(config["MODEL"]["VAE_CHECKPOINT"], map_location=device))
     vae.to(device)
 
@@ -83,6 +83,9 @@ def save_train_chunks():
     while True:
         chunk_path = os.path.join(output_path, f"train_chunk_{chunk_id}")
         if not os.path.exists(chunk_path):
+            break
+
+        if chunk_id == 1: # use this to only create one chunk for debugging
             break
 
         dataset = load_from_disk(chunk_path)

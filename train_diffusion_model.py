@@ -1,6 +1,6 @@
+# --- train_diffusion_model.py ---
 import os
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import load_from_disk
@@ -8,8 +8,9 @@ from tqdm import tqdm
 import yaml
 import wandb
 from transformers import AutoTokenizer, AutoModel
-from models.vae import VAE
-from models.latent_unet import LatentUNet
+from models.vae_enhanced import EnhancedVAE
+from models.diffusion import DiffusionModel
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # --- Load config.yaml ---
 with open("config/config.yaml", "r") as f:
@@ -34,7 +35,7 @@ CONFIG = {
 }
 
 # --- Init Weights & Biases ---
-wandb.init(project=CONFIG["project"], name=CONFIG["run_name"], config=config)
+wandb.init(project="xray", name="train_diffusion", config=config)
 
 # --- Load tokenizer and text encoder ---
 tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
@@ -49,7 +50,7 @@ def collate_fn(batch):
     }
 
 # --- Load VAE ---
-vae = VAE(latent_dim=CONFIG["latent_dim"]).to(CONFIG["device"])
+vae = EnhancedVAE(latent_dim=CONFIG["latent_dim"]).to(CONFIG["device"])
 vae.load_state_dict(torch.load(CONFIG["vae_checkpoint"], map_location=CONFIG["device"]))
 vae.eval()
 
@@ -58,9 +59,9 @@ val_dataset = load_from_disk(CONFIG["val_dataset_path"])
 val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=collate_fn)
 
 # --- Initialize diffusion model ---
-model = LatentUNet(CONFIG["latent_dim"]).to(CONFIG["device"])
+model = DiffusionModel(config).to(CONFIG["device"])
 optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["lr"])
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 scheduler = ReduceLROnPlateau(
     optimizer,
     mode=CONFIG["lr_scheduler_mode"],
@@ -79,7 +80,11 @@ for epoch in range(CONFIG["epochs"]):
     chunk_id = 0
     while True:
         chunk_path = os.path.join(CONFIG["output_path"], f"train_chunk_{chunk_id}")
+
         if not os.path.exists(chunk_path):
+            break
+
+        if chunk_id == 1: # use this to train on one chunk for speed or debugging
             break
 
         train_dataset = load_from_disk(chunk_path)
@@ -91,21 +96,22 @@ for epoch in range(CONFIG["epochs"]):
             attention_mask = batch["attention_mask"].to(CONFIG["device"])
 
             with torch.no_grad():
-                z = vae.encode(image)
-                text_emb = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0]
+                z = vae.encode(image).view(-1, CONFIG["latent_dim"], 16, 16)
+                batch_size = z.shape[0]
+                input_ids = input_ids[:batch_size]
+                attention_mask = attention_mask[:batch_size]
+                reports = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
 
             noise = torch.randn_like(z)
-            z_noisy = z + noise
-
-            pred_noise = model(z_noisy, text_emb)
-            loss = F.mse_loss(pred_noise, noise)
+            pred_noise, target_noise = model(z, noise, reports)
+            print("pred_noise std:", pred_noise.std().item(), "| noise std:", noise.std().item())
+            loss = F.mse_loss(pred_noise, target_noise)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_train_loss += loss.item()
-            wandb.log({"train/loss": loss.item()})
 
         chunk_id += 1
 
@@ -115,29 +121,67 @@ for epoch in range(CONFIG["epochs"]):
     # --- Validation ---
     model.eval()
     total_val_loss = 0.0
+    num_samples = 4  # log only a few to save time
+    images = []
+
     with torch.no_grad():
+
         for batch in tqdm(val_loader, desc=f"Epoch {epoch+1} [Val]"):
             image = batch["image"].to(CONFIG["device"])
             input_ids = batch["input_ids"].to(CONFIG["device"])
             attention_mask = batch["attention_mask"].to(CONFIG["device"])
 
             z = vae.encode(image)
-            text_emb = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0]
-
+            reports = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
             noise = torch.randn_like(z)
-            z_noisy = z + noise
-            pred_noise = model(z_noisy, text_emb)
+            pred_noise, target_noise = model(z, noise, reports)
 
-            val_loss = F.mse_loss(pred_noise, noise)
+            val_loss = F.mse_loss(pred_noise, target_noise)
             total_val_loss += val_loss.item()
-            wandb.log({"val/loss": val_loss.item()})
 
-    avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_loss = total_val_loss / len(val_loader)
+        
+
+        val_iter = iter(val_loader)
+        batch = next(val_iter)
+
+        input_ids = batch["input_ids"][:num_samples].to(CONFIG["device"])
+        attention_mask = batch["attention_mask"][:num_samples].to(CONFIG["device"])
+
+        # Sample latent z from diffusion process
+        # report_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+        # z_sample = model.sample(report_texts, latent_shape=(num_samples, CONFIG["latent_dim"], 16, 16), device=CONFIG["device"])
+        # recon = vae.decode(z_sample).cpu().clamp(0, 1)
+
+        # for i in range(num_samples):
+        #     caption = report_texts[i].strip()
+        #     images.append(wandb.Image(recon[i], caption=caption))
+
+        # Sample latent z from diffusion process and decode intermediate steps
+        report_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+        z_sample, intermediate_recons = model.sample(
+            report_texts,
+            latent_shape=(num_samples, CONFIG["latent_dim"], 16, 16),
+            device=CONFIG["device"],
+            vae=vae,  # 🔥 Pass the VAE explicitly
+            step_interval=50
+        )
+
+        # Log intermediate reconstructions
+        for t_step, recon in intermediate_recons:
+            for i in range(num_samples):
+                caption = f"t={t_step} | {report_texts[i].strip()}"
+                images.append(wandb.Image(recon[i], caption=caption))
+
+
     scheduler.step(avg_val_loss)
 
     wandb.log({
-        "val/avg_loss": avg_val_loss,
-        "best/val_loss": best_val_loss
+        "epoch": epoch + 1,
+        "lr": optimizer.param_groups[0]["lr"],
+        "train/avg_loss": avg_train_loss,
+        "val/loss": avg_val_loss,
+        "sampled_reconstructions": images
     })
 
     if avg_val_loss < best_val_loss:

@@ -4,7 +4,7 @@ import torch.nn as nn
 
 
 class Encoder(nn.Module):
-    def __init__(self, in_channels=1, latent_dim=64):
+    def __init__(self, in_channels=1, latent_dim=256):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Conv2d(in_channels, 32, 4, 2, 1),  # 256 -> 128
@@ -27,7 +27,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, out_channels=1, latent_dim=64):
+    def __init__(self, out_channels=1, latent_dim=256):
         super().__init__()
         self.latent_dim = latent_dim
         self.decoder_input = nn.Linear(latent_dim, 128 * 32 * 32) # Match encoder's flattened_dim

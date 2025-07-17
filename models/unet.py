@@ -37,7 +37,7 @@ class sinusoidal_time_embedding(nn.Module):
 
 class conditional_unet(nn.Module):
 
-    def __init__(self, in_channels=8, base_channels=64, time_dim=128, context_dim=768):
+    def __init__(self, in_channels=8, base_channels=64, time_dim=128, context_dim=768, latent_dim=256):
         super().__init__()
 
         self.time_mlp = nn.Sequential(
@@ -47,6 +47,7 @@ class conditional_unet(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
+        self.cond_proj = nn.Linear(time_dim, latent_dim)
         self.context_proj = nn.Linear(context_dim, time_dim)
 
         self.enc1 = residual_block(in_channels, base_channels)
@@ -59,11 +60,16 @@ class conditional_unet(nn.Module):
         self.dec1 = residual_block(base_channels * 2 + base_channels, base_channels)
         self.out_conv = nn.Conv2d(base_channels, in_channels, 1)
 
+
+
     def forward(self, x, t, context):
-        t_emb = self.time_mlp(t)
-        c_emb = self.context_proj(context)
-        cond = t_emb + c_emb
-        cond = cond[:, :, None, None]  # expand to spatial
+        t_emb = self.time_mlp(t)               # [B, time_dim]
+        c_emb = self.context_proj(context)     # [B, time_dim]
+        cond = t_emb + c_emb                   # [B, time_dim]
+        cond = self.cond_proj(cond)            # [B, latent_dim]
+        cond = cond[:, :, None, None]          # [B, latent_dim, 1, 1]
+
+        x = x + cond                           # ✅ inject conditioning
 
         x1 = self.enc1(x)
         x2 = self.enc2(self.pool(x1))
