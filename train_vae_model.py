@@ -6,7 +6,7 @@ import wandb
 import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.optim import AdamW
 from datasets import load_from_disk
 from models.vae_enhanced import EnhancedVAE
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -14,20 +14,19 @@ from pytorch_msssim import ssim as ssim_loss_fn
 
 
 def vae_loss_function(recon_x, x, mu, logvar, beta=1.0, ssim_weight=0.5):
-    original_logvar = logvar.detach().clone()  # Save before clamp
+    # original_logvar = logvar.detach().clone()  # Save before clamp
     logvar = torch.clamp(logvar, min=-4.0)
     mse_loss = F.mse_loss(recon_x, x, reduction='mean')
     ssim_loss = 1 - ssim_loss_fn(recon_x, x, data_range=1.0, size_average=True)
     recon_loss = (1 - ssim_weight) * mse_loss + ssim_weight * ssim_loss
-    # kl_div = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
     raw_kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
     free_nats = 1  # you can tune this
     kl_div = torch.mean(torch.maximum(raw_kl, torch.tensor(free_nats, device=logvar.device)))
 
     # Debug output
-    print("raw logvar mean (before clamp):", original_logvar.mean().item())
-    print("clamped logvar mean:", logvar.mean().item())
-    print("KL divergence:", kl_div.item())
+    # print("raw logvar mean (before clamp):", original_logvar.mean().item())
+    # print("clamped logvar mean:", logvar.mean().item())
+    # print("KL divergence:", kl_div.item())
 
     return recon_loss + beta * kl_div, recon_loss, kl_div
 
@@ -47,7 +46,7 @@ latent_dim = config["MODEL"]["LATENT_DIM"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 vae = EnhancedVAE(latent_dim=latent_dim).to(device)
-optimizer = Adam(vae.parameters(), lr=learning_rate)
+optimizer = AdamW(vae.parameters(), lr=learning_rate)
 
 scheduler = ReduceLROnPlateau(
     optimizer,
@@ -79,7 +78,7 @@ for epoch in range(epochs):
         if not os.path.exists(train_chunk_path):
             break
 
-        if chunk_id == 1: # use this to only load five chunks
+        if chunk_id == 1: # use this to only load one chunk
             break
 
         train_dataset = load_from_disk(train_chunk_path)
@@ -145,14 +144,14 @@ for epoch in range(epochs):
     scheduler.step(val_loss)
     wandb.log({
         "lr": optimizer.param_groups[0]["lr"],
-        "kl_ratio": kl_ratio,
+        "train/kl_ratio": kl_ratio,
         "reconstructions": images,
-        "train_loss": train_loss,
-        "train_recon": train_recon,
-        "train_kl": train_kl,
-        "val_loss": val_loss,
-        "val_recon": val_recon,
-        "val_kl": val_kl,
+        "train/loss": train_loss,
+        "train/recon": train_recon,
+        "train/kl": train_kl,
+        "val/loss": val_loss,
+        "val/recon": val_recon,
+        "val/kl": val_kl,
         "epoch": epoch + 1
     })
 

@@ -2,6 +2,7 @@
 import os
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from datasets import load_from_disk
 from tqdm import tqdm
@@ -60,7 +61,7 @@ val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=Fa
 
 # --- Initialize diffusion model ---
 model = DiffusionModel(config).to(CONFIG["device"])
-optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["lr"])
+optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["lr"])
 
 scheduler = ReduceLROnPlateau(
     optimizer,
@@ -73,9 +74,12 @@ scheduler = ReduceLROnPlateau(
 best_val_loss = float("inf")
 patience_counter = 0
 
+model.train()
+
 for epoch in range(CONFIG["epochs"]):
     model.train()
     total_train_loss = 0.0
+    total_batches = 0
 
     chunk_id = 0
     while True:
@@ -96,7 +100,7 @@ for epoch in range(CONFIG["epochs"]):
             attention_mask = batch["attention_mask"].to(CONFIG["device"])
 
             with torch.no_grad():
-                z = vae.encode(image).view(-1, CONFIG["latent_dim"], 16, 16)
+                z = vae.encode(image)
                 batch_size = z.shape[0]
                 input_ids = input_ids[:batch_size]
                 attention_mask = attention_mask[:batch_size]
@@ -104,19 +108,23 @@ for epoch in range(CONFIG["epochs"]):
 
             noise = torch.randn_like(z)
             pred_noise, target_noise = model(z, noise, reports)
-            print("pred_noise std:", pred_noise.std().item(), "| noise std:", noise.std().item())
-            loss = F.mse_loss(pred_noise, target_noise)
+            pred_noise_resized = nn.functional.interpolate(
+                pred_noise, size=target_noise.shape[2:], mode="bilinear", align_corners=False
+                                                    )
+            loss = F.smooth_l1_loss(pred_noise_resized, target_noise)
+            cos_sim = F.cosine_similarity(pred_noise_resized.flatten(1), target_noise.flatten(1), dim=1).mean().item()
+
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_train_loss += loss.item()
+            total_batches += 1
 
         chunk_id += 1
 
-    avg_train_loss = total_train_loss / max(1, chunk_id)
-    wandb.log({"train/avg_loss": avg_train_loss, "epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]})
+    avg_train_loss = total_train_loss / max(1, total_batches)
 
     # --- Validation ---
     model.eval()
@@ -135,8 +143,15 @@ for epoch in range(CONFIG["epochs"]):
             reports = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
             noise = torch.randn_like(z)
             pred_noise, target_noise = model(z, noise, reports)
+            pred_noise_resized = nn.functional.interpolate(
+                pred_noise, size=target_noise.shape[2:], mode="bilinear", align_corners=False
+                                                    )
 
-            val_loss = F.mse_loss(pred_noise, target_noise)
+            val_loss = F.smooth_l1_loss(pred_noise_resized, target_noise)
+            val_cos_sim = F.cosine_similarity(pred_noise_resized.flatten(1), target_noise.flatten(1), dim=1).mean().item()
+            val_pred_std = pred_noise_resized.std().item()
+
+
             total_val_loss += val_loss.item()
 
         avg_val_loss = total_val_loss / len(val_loader)
@@ -147,17 +162,6 @@ for epoch in range(CONFIG["epochs"]):
 
         input_ids = batch["input_ids"][:num_samples].to(CONFIG["device"])
         attention_mask = batch["attention_mask"][:num_samples].to(CONFIG["device"])
-
-        # Sample latent z from diffusion process
-        # report_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-        # z_sample = model.sample(report_texts, latent_shape=(num_samples, CONFIG["latent_dim"], 16, 16), device=CONFIG["device"])
-        # recon = vae.decode(z_sample).cpu().clamp(0, 1)
-
-        # for i in range(num_samples):
-        #     caption = report_texts[i].strip()
-        #     images.append(wandb.Image(recon[i], caption=caption))
-
-        # Sample latent z from diffusion process and decode intermediate steps
         report_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
         z_sample, intermediate_recons = model.sample(
             report_texts,
@@ -179,19 +183,19 @@ for epoch in range(CONFIG["epochs"]):
     wandb.log({
         "epoch": epoch + 1,
         "lr": optimizer.param_groups[0]["lr"],
-        "train/avg_loss": avg_train_loss,
+        "train/loss": avg_train_loss,
         "val/loss": avg_val_loss,
-        "sampled_reconstructions": images
+        "sampled_reconstructions": images,
+        "train/pred_noise_std": pred_noise_resized.std().item(),
+        "train/cosine_sim": cos_sim,
+        "val/pred_noise_std": val_pred_std,
+        "val/cosine_sim": val_cos_sim
     })
 
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         patience_counter = 0
         torch.save(model.state_dict(), CONFIG["checkpoint_path"])
-        wandb.log({
-            "best/epoch": epoch + 1,
-            "best/checkpoint_path": CONFIG["checkpoint_path"]
-        })
     else:
         patience_counter += 1
         print(f"No improvement. Patience: {patience_counter}/{CONFIG['early_stopping_patience']}")

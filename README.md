@@ -27,10 +27,6 @@ This project explores a novel direction in multimodal learning: generating reali
 │   ├── diffusion.py                   # End-to-end diffusion model wrapper
 │   └── latent_unet.py                 # Lightweight UNet for simplified latent training
 │
-├── sampling/
-│   ├── sampler.py                     # DDPM sampling logic
-│   └── sample_utils.py                # Classifier-free sampling from text
-│
 ├── scheduler/
 │   └── ddpm_scheduler.py              # Beta schedule for DDPM diffusion
 │

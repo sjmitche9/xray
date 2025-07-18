@@ -3,7 +3,7 @@ import torch
 import yaml
 import numpy as np
 from PIL import Image
-from models.vae import VAE
+from models.vae_enhanced import EnhancedVAE
 from models.text_encoder import text_encoder
 from models.unet import conditional_unet
 from scheduler.ddpm_scheduler import ddpm_scheduler
@@ -19,7 +19,7 @@ TRAIN_CFG = config["TRAINING"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # init models
-vae = VAE().to(device)
+vae = EnhancedVAE().to(device)
 vae.load_state_dict(torch.load(MODEL_CFG["VAE_CHECKPOINT"], map_location=device))
 vae.eval()
 
@@ -32,8 +32,9 @@ report = "lungs are clear. no acute cardiopulmonary abnormality."
 context = text_enc([report]).to(device)
 null_context = torch.zeros_like(context)
 
-# sample
+# sample latent
 z = torch.randn(1, MODEL_CFG["LATENT_DIM"], MODEL_CFG["LATENT_H"], MODEL_CFG["LATENT_W"]).to(device)
+
 for t_gen in reversed(range(scheduler.num_timesteps)):
     t_tensor = torch.full((1,), t_gen, device=device, dtype=torch.long)
     pred_cond = unet(z, t_tensor, context)
@@ -48,7 +49,11 @@ for t_gen in reversed(range(scheduler.num_timesteps)):
     if t_gen > 0:
         z += torch.sqrt(beta_t) * torch.randn_like(z)
 
+# post-process latent
+z = (z - z.mean()) / (z.std() + 1e-5)
+z = z.clamp(-5, 5)
+
 # decode and view
-image = vae.decode(z)[0].squeeze(0).cpu().numpy()
+image = vae.decode(z.detach())[0].squeeze(0).cpu().numpy()
 image = (image * 255).astype(np.uint8)
 Image.fromarray(image).show()

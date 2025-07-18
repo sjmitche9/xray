@@ -51,7 +51,6 @@ class EnhancedVAE(nn.Module):
     def forward(self, x):
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-        z += 0.2 * torch.randn_like(z)  # ← NEW
         recon = self.decoder(z)
         return recon, mu, logvar
 
