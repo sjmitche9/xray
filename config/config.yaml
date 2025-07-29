@@ -1,4 +1,4 @@
-# --- config/config.yaml ---
+# config/config.yaml
 
 # dataset config
 DATASET:
@@ -8,34 +8,35 @@ DATASET:
   OUTPUT_PATH: "data/processed_dataset/fullset" # use /subset for testing and debugging (100 images)
   IMAGE_SIZE: 256
   MAX_REPORT_LENGTH: 128
-  LIMIT_SAMPLES: "none"  # set to null or a number like 100 for quick tests
-  NUM_CPUS: 8 # keep this low when creating latent dataset
+  LIMIT_SAMPLES: null  # set to null or a number like 100 for quick tests
+  NUM_CPUS: 8
 
 # model config
 MODEL:
   DIFFUSION_CHECKPOINT: "checkpoints/diffusion.pt"
   DIFFUSION_RESUME: false
   TOKENIZER_NAME: "emilyalsentzer/Bio_ClinicalBERT"
+  BASE_CHANNELS: 32
   LATENT_DIM: 256
   LATENT_H: 16
   LATENT_W: 16
   VAE_CHECKPOINT: "checkpoints/vae.pt"
   VAE_RESUME: false
-  # TEXT_TO_LATENT_CHECKPOINT: "checkpoints/text_to_latent.pt"
-  # TEXT_TO_LATENT_RESUME: false
-  # TEXT_TO_IMAGE_CHECKPOINT: "checkpoints/text_to_image.pt"
-  # TEXT_TO_IMAGE_RESUME: false
 
 # training config
 TRAINING:
-  BATCH_SIZE: 256
-  EPOCHS: 50
-  LEARNING_RATE: 2e-4
+  BATCH_SIZE: 24
+  GRAD_ACCUM_STEPS: 2
+  EPOCHS: 100
+  LEARNING_RATE: 5e-5
   CONTEXT_DROPOUT_PROB: 0.1
-  GUIDANCE_SCALE: 0
-  BETA: 0.0001
-  WARMUP_EPOCHS: 30
-  EARLY_STOP_PATIENCE: 5
+  GUIDANCE_SCALE: 7.5
+  BETA: 5
+  WARMUP_EPOCHS: 1
+  EARLY_STOP_PATIENCE: 10
+  MIN_SAVE_EPOCH: 3
+  TRAIN_ON_ONE_BATCH: false # use this for debugging
+  CHUNK_LIMIT: 5 # this limits the number of chunks loaded and trained on
 
   LR_SCHEDULER:
     TYPE: "ReduceLROnPlateau"

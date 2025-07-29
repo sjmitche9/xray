@@ -1,4 +1,4 @@
-# --- models/text_encoder.py ---
+# models/text_encoder.py
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
 

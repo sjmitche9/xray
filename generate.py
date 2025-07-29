@@ -1,4 +1,4 @@
-# --- generate.py ---
+# generate.py
 import torch
 import yaml
 import numpy as np

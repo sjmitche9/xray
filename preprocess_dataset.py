@@ -1,4 +1,4 @@
-# --- preprocess_dataset.py ---
+# preprocess_dataset.py
 import os
 import pandas as pd
 import numpy as np
@@ -15,7 +15,11 @@ def process_row(row, root_dir, image_size, tokenizer):
     study_id = row.study_id
     dicom_id = row.dicom_id
     split_group = row["split"]
-    report = row.get("study_description", "")
+    report = row["report"]
+
+    orientation = str(row.get("ViewPosition", "")).strip().lower()
+    if orientation:
+        report += f", view: {orientation}"
 
     image_path = os.path.join(
         root_dir,
@@ -48,7 +52,6 @@ def process_row(row, root_dir, image_size, tokenizer):
 
 
 def process_train_in_batches(split_df, root_dir, image_size, tokenizer, num_cpus, output_path, batch_size=10000):
-
     print(f"[info] processing train set in batches with {len(split_df)} rows...")
     rows = [row for _, row in split_df.iterrows()]
     features = Features({
@@ -77,7 +80,6 @@ def process_train_in_batches(split_df, root_dir, image_size, tokenizer, num_cpus
 
 
 def process_split(split_name, split_df, root_dir, image_size, tokenizer, num_cpus):
-
     print(f"[info] processing {split_name} set with {len(split_df)} rows...")
     with mp.Pool(processes=num_cpus) as pool:
         func = partial(process_row, root_dir=root_dir, image_size=image_size, tokenizer=tokenizer)
@@ -97,14 +99,39 @@ def main():
     split_path = data_cfg["SPLIT_PATH"]
     output_path = data_cfg["OUTPUT_PATH"]
     image_size = data_cfg["IMAGE_SIZE"]
-    limit_samples = data_cfg.get("LIMIT_SAMPLES", None)
     num_cpus = data_cfg.get("NUM_CPUS", 4)
+    limit_samples = data_cfg.get("LIMIT_SAMPLES", None)
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
+    # Load metadata
     metadata = pd.read_csv(metadata_path)
     split = pd.read_csv(split_path)
-    df = pd.merge(metadata, split, on=["dicom_id", "subject_id", "study_id"], how="inner")
+
+    # Load labels
+    chexpert = pd.read_csv("data/mimic-cxr-jpg/mimic-cxr-2.0.0-chexpert.csv")
+    negbio = pd.read_csv("data/mimic-cxr-jpg/mimic-cxr-2.0.0-negbio.csv")
+    label_names = [
+        "Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Enlarged Cardiomediastinum",
+        "Fracture", "Lung Lesion", "Lung Opacity", "Pleural Effusion", "Pneumonia",
+        "Pneumothorax", "Pleural Other", "Support Devices", "No Finding"
+    ]
+    labels = pd.merge(chexpert, negbio, on=["subject_id", "study_id"], suffixes=("_chex", "_neg"))
+
+    def agree(row):
+        agreed = []
+        for label in label_names:
+            v1 = row.get(f"{label}_chex")
+            v2 = row.get(f"{label}_neg")
+            if v1 == 1.0 and v2 == 1.0:
+                agreed.append(label.lower())
+        return ", ".join(agreed) if agreed else "no finding"
+
+    labels["report"] = labels.apply(agree, axis=1)
+
+    # Merge all
+    df = pd.merge(metadata, split, on=["subject_id", "study_id", "dicom_id"], how="inner")
+    df = pd.merge(df, labels[["subject_id", "study_id", "report"]], on=["subject_id", "study_id"], how="inner")
 
     if limit_samples is not None:
         df = df.groupby("split").apply(lambda x: x.head(limit_samples)).reset_index(drop=True)
