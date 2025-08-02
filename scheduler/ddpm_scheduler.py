@@ -20,3 +20,18 @@ class ddpm_scheduler:
 
     def get_alpha_hat(self, t):
         return self.alpha_hat[t]
+    
+    def denoise(self, noisy, pred_noise, t):
+        """
+        Estimate the clean image x_0 from a noisy image and predicted noise.
+        """
+        device = noisy.device
+        alpha = self.alpha.to(device)
+        alpha_hat = self.alpha_hat.to(device)
+
+        alpha_t = alpha[t].view(-1, 1, 1, 1)
+        alpha_hat_t = alpha_hat[t].view(-1, 1, 1, 1)
+
+        # DDPM reverse step: x_0 = (noisy - (1 - alpha_t) / sqrt(1 - alpha_hat_t) * pred_noise) / sqrt(alpha_t)
+        x0_est = (noisy - ((1 - alpha_t) / torch.sqrt(1 - alpha_hat_t)) * pred_noise) / torch.sqrt(alpha_t)
+        return x0_est

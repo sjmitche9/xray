@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 class residual_block(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dropout=.1):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=1),
@@ -11,7 +11,8 @@ class residual_block(nn.Module):
             nn.SiLU(),
             nn.Conv2d(out_channels, out_channels, 3, padding=1),
             nn.GroupNorm(8, out_channels),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.Dropout2d(dropout)
         )
         self.skip = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 

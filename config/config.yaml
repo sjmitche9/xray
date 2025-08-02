@@ -6,6 +6,7 @@ DATASET:
   METADATA_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-metadata.csv"
   SPLIT_PATH: "data/mimic-cxr-jpg/mimic-cxr-2.0.0-split.csv"
   OUTPUT_PATH: "data/processed_dataset/fullset" # use /subset for testing and debugging (100 images)
+  LATENT_OUTPUT_PATH: "data/processed_dataset/latent"
   IMAGE_SIZE: 256
   MAX_REPORT_LENGTH: 128
   LIMIT_SAMPLES: null  # set to null or a number like 100 for quick tests
@@ -16,33 +17,36 @@ MODEL:
   DIFFUSION_CHECKPOINT: "checkpoints/diffusion.pt"
   DIFFUSION_RESUME: false
   TOKENIZER_NAME: "emilyalsentzer/Bio_ClinicalBERT"
-  BASE_CHANNELS: 32
-  LATENT_DIM: 256
-  LATENT_H: 16
-  LATENT_W: 16
+  BASE_CHANNELS: 4
+  LATENT_DIM: 4
+  LATENT_H: 64
+  LATENT_W: 64
   VAE_CHECKPOINT: "checkpoints/vae.pt"
   VAE_RESUME: false
 
 # training config
 TRAINING:
-  BATCH_SIZE: 24
-  GRAD_ACCUM_STEPS: 2
+  BATCH_SIZE: 64
+  GRAD_ACCUM_STEPS: 4
   EPOCHS: 100
-  LEARNING_RATE: 5e-5
-  CONTEXT_DROPOUT_PROB: 0.1
-  GUIDANCE_SCALE: 7.5
-  BETA: 5
-  WARMUP_EPOCHS: 1
+  LEARNING_RATE: 1e-5
+  CONTEXT_DROPOUT_PROB: 0
+  GUIDANCE_SCALE: 0
+  BETA: 1
+  WARMUP_EPOCHS: 20
   EARLY_STOP_PATIENCE: 10
   MIN_SAVE_EPOCH: 3
-  TRAIN_ON_ONE_BATCH: false # use this for debugging
-  CHUNK_LIMIT: 5 # this limits the number of chunks loaded and trained on
+  TRAIN_ON_ONE_BATCH: true # use this for debugging
+  CHUNK_LIMIT: 1 # this limits the number of chunks loaded and trained on
 
   LR_SCHEDULER:
     TYPE: "ReduceLROnPlateau"
     PATIENCE: 3
-    FACTOR: 0.5
-    MIN_LR: 1e-6
+    FACTOR: 0.75
+    MIN_LR: 1e-7
+
+SCHEDULER:
+  TIMESTEPS: 250
 
 # logging
 WANDB:

@@ -16,3 +16,4 @@ h5py
 # ray # whl must be downloaded and installed for windows and python version
 scikit-image
 pytorch-msssim
+diffusers
