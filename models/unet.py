@@ -1,6 +1,7 @@
 # models/unet.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class residual_block(nn.Module):
     def __init__(self, in_channels, out_channels, dropout=.1):
@@ -32,7 +33,7 @@ class sinusoidal_time_embedding(nn.Module):
         return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
 
 class conditional_unet(nn.Module):
-    def __init__(self, in_channels=1, base_channels=96, time_dim=128, context_dim=768):
+    def __init__(self, in_channels=1, base_channels=96, time_dim=128, context_dim=768, context_dropout=0):
         super().__init__()
 
         self.time_mlp = nn.Sequential(
@@ -41,6 +42,7 @@ class conditional_unet(nn.Module):
             nn.SiLU(),
             nn.Linear(time_dim, time_dim)
         )
+        self.context_dropout = context_dropout
         self.context_proj = nn.Linear(context_dim, time_dim)
         self.cond_proj = nn.Linear(time_dim, base_channels * 8)
 
@@ -72,6 +74,8 @@ class conditional_unet(nn.Module):
     def forward(self, x, t, context):
         # Combine context and time
         t_emb = self.time_mlp(t)
+        if self.context_dropout > 0 and self.training:
+            context = F.dropout(context, p=self.context_dropout)
         c_emb = self.context_proj(context)
         cond = t_emb + c_emb
         cond = self.cond_proj(cond).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]

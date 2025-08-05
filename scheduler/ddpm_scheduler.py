@@ -3,7 +3,7 @@ import torch
 
 class ddpm_scheduler:
 
-    def __init__(self, num_timesteps=500, beta_start=1e-4, beta_end=0.02):
+    def __init__(self, num_timesteps=200, beta_start=1e-4, beta_end=0.02):
         self.num_timesteps = num_timesteps
         self.beta = torch.linspace(beta_start, beta_end, num_timesteps).to(torch.float32)
         self.alpha = (1.0 - self.beta).to(torch.float32)

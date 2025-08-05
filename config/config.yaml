@@ -27,16 +27,18 @@ MODEL:
 # training config
 TRAINING:
   BATCH_SIZE: 64
-  GRAD_ACCUM_STEPS: 4
+  GRAD_ACCUM_STEPS: 2
   EPOCHS: 100
   LEARNING_RATE: 1e-5
-  CONTEXT_DROPOUT_PROB: 0
-  GUIDANCE_SCALE: 0
+  CONTEXT_DROPOUT_PROB: 0.3
+  GUIDANCE_SCALE: 5
   BETA: 1
+  KL_MAX_WEIGHT: .1
+  KL_ANNEAL_EPOCHS: 10
   WARMUP_EPOCHS: 20
   EARLY_STOP_PATIENCE: 10
   MIN_SAVE_EPOCH: 3
-  TRAIN_ON_ONE_BATCH: true # use this for debugging
+  TRAIN_ON_ONE_BATCH: false # use this for debugging
   CHUNK_LIMIT: 1 # this limits the number of chunks loaded and trained on
 
   LR_SCHEDULER:
@@ -46,7 +48,7 @@ TRAINING:
     MIN_LR: 1e-7
 
 SCHEDULER:
-  TIMESTEPS: 250
+  SAMPLING_STEPS: 200
 
 # logging
 WANDB:
