@@ -15,11 +15,40 @@ from transformers import AutoTokenizer, AutoModel
 from skimage.metrics import peak_signal_noise_ratio as compute_psnr
 from pytorch_msssim import ssim as compute_ssim
 
-def composite_loss(pred, target, alpha=1.0, beta=0.1, gamma=0.25):
+# def composite_loss(pred, target, alpha=1.0, beta=0.1, gamma=0.25):
+#     l1 = F.smooth_l1_loss(pred, target)
+#     cos = 1 - F.cosine_similarity(pred.flatten(1), target.flatten(1)).mean()
+#     std_penalty = 1.0 / (pred.std() + 1e-6)
+#     return alpha * l1 + beta * cos + gamma * std_penalty
+
+
+
+def local_variance_penalty(img, eps=1e-6):
+    var = torch.var(img, dim=[2, 3], keepdim=False)  # (B,)
+    return torch.mean(1.0 / (var + eps))
+
+def perceptual_loss(vgg, pred, target):
+    with torch.no_grad():
+        f_pred = vgg(pred.repeat(1, 3, 1, 1))
+        f_target = vgg(target.repeat(1, 3, 1, 1))
+    return F.l1_loss(f_pred, f_target)
+
+perceptual_loss_fn = PerceptualLoss().to(device)
+
+def composite_loss(pred, target, alpha=1.0, beta=0.2, gamma=0.25, delta=0.01):
     l1 = F.smooth_l1_loss(pred, target)
-    cos = 1 - F.cosine_similarity(pred.flatten(1), target.flatten(1)).mean()
-    std_penalty = 1.0 / (pred.std() + 1e-6)
-    return alpha * l1 + beta * cos + gamma * std_penalty
+    ssim_val = 1 - compute_ssim(pred, target, data_range=1.0)
+    var_penalty = local_variance_penalty(pred)
+    perceptual = perceptual_loss_fn(pred, target)
+    total = alpha * l1 + beta * ssim_val + gamma * var_penalty + delta * perceptual
+    return total, {
+        "l1": l1.item(),
+        "ssim": ssim_val.item(),
+        "var": var_penalty.item(),
+        "perceptual": perceptual.item()
+    }
+
+
 
 
 def to_grayscale(img_tensor):
@@ -52,6 +81,7 @@ CONFIG = {
     "min_lr": float(config["TRAINING"]["LR_SCHEDULER"].get("MIN_LR", 1e-7)),
     "sampling_steps": config["SCHEDULER"].get("SAMPLING_STEPS", 200),
     "context_dropout": float(config["TRAINING"].get("CONTEXT_DROPOUT_PROB", 0)),
+    "unet_base_channels": int(config["MODEL"].get("UNET_BASE_CHANNELS", 96))
 }
 
 if __name__ == "__main__":
@@ -61,7 +91,13 @@ if __name__ == "__main__":
     text_encoder = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT").to(CONFIG["device"]).eval()
 
     scheduler = ddpm_scheduler(num_timesteps=CONFIG["sampling_steps"])
-    model = conditional_unet(in_channels=CONFIG["latent_dim"], context_dim=768, context_dropout=CONFIG["context_dropout"]).to(CONFIG["device"])
+    model = conditional_unet(
+        in_channels=CONFIG["latent_dim"], 
+        context_dim=768, 
+        context_dropout=CONFIG["context_dropout"],
+        base_channels=CONFIG["unet_base_channels"]
+        ).to(CONFIG["device"])
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["lr"])
     scheduler_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -256,9 +292,9 @@ if __name__ == "__main__":
             best_val_loss = avg_val_loss
             patience_counter = 0
             torch.save(model.state_dict(), CONFIG["checkpoint_path"])
-            artifact = wandb.Artifact("best_model", type="model")
-            artifact.add_file(CONFIG["checkpoint_path"])
-            wandb.log_artifact(artifact)
+            # artifact = wandb.Artifact("best_model", type="model")
+            # artifact.add_file(CONFIG["checkpoint_path"])
+            # wandb.log_artifact(artifact)
             print(f"[info] Saved new best model at epoch {epoch+1}")
         elif (epoch + 1) >= CONFIG["min_save_epoch"]:
             patience_counter += 1
