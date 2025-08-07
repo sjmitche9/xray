@@ -5,13 +5,23 @@ from diffusers import AutoencoderKL
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+import yaml
+
+with open("config/config.yaml") as f:
+	config = yaml.safe_load(f)
 
 # Load VAE
-vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to("cuda").eval()
+vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
+ckpt = config["MODEL"].get("VAE_CHECKPOINT")
+if ckpt and os.path.exists(ckpt):
+    vae.load_state_dict(torch.load(ckpt, map_location="cpu"))
+else:
+    print(f"[warn] VAE_CHECKPOINT not found at {ckpt}. Using base sd-vae-ft-ema.")
+vae = vae.to("cuda").eval()
 
 # Paths
-input_root = "data/processed_dataset/fullset"
-output_root = "data/processed_dataset/latent"
+input_root = config["DATASET"]["OUTPUT_PATH"]
+output_root = config["DATASET"]["LATENT_OUTPUT_PATH"]
 os.makedirs(output_root, exist_ok=True)
 
 def encode_chunk(dataset, batch_size=16, num_workers=4):
@@ -23,15 +33,22 @@ def encode_chunk(dataset, batch_size=16, num_workers=4):
             imgs = imgs.repeat(1, 3, 1, 1)
 
         with torch.no_grad():
-            zs = vae.encode(imgs).latent_dist.sample()
-            # print("[debug] sampled latent dtype:", zs.dtype)
+            zs = vae.encode(imgs).latent_dist.sample() * vae.config.scaling_factor
             zs = zs.float().cpu()
 
+
         for z, report in zip(zs, batch["report"]):
+            z = z.cpu().float()
+
+            # Add shape check + logging
+            if z.shape != (config["MODEL"]["LATENT_DIM"], config["MODEL"]["LATENT_H"], config["MODEL"]["LATENT_W"]):
+                raise ValueError(f"❌ Latent has wrong shape: {z.shape}")
+
             latents.append({
-                "z_target": z.numpy().astype("float32"),  # enforce float32 for storage
+                "z_target": z.numpy().astype("float32"),
                 "report": report
             })
+
     return latents
 
 def encode_and_save(dataset_path, output_path, split_desc):
@@ -46,7 +63,7 @@ def encode_and_save(dataset_path, output_path, split_desc):
 
     os.makedirs(output_path, exist_ok=True)
     features = Features({
-        "z_target": Array3D(shape=(4, 32, 32), dtype="float32"),  # adjust shape as needed
+        "z_target": Array3D(shape=(config["MODEL"]["LATENT_DIM"], config["MODEL"]["LATENT_H"], config["MODEL"]["LATENT_W"]), dtype="float32"),  # adjust shape as needed
         "report": Value("string")
     })
 
@@ -63,6 +80,7 @@ def main():
         out_path = os.path.join(output_root, f"latent_train_chunk_{chunk_id}")
         encode_and_save(chunk_path, out_path, f"train_chunk_{chunk_id}")
         chunk_id += 1
+        break # use this to only create one chunk and skip to the val/test
 
     # --- Val/Test ---
     for split in ["val", "test"]:

@@ -20,26 +20,33 @@ MODEL:
   BASE_CHANNELS: 4
   UNET_BASE_CHANNELS: 32
   LATENT_DIM: 4
-  LATENT_H: 64
-  LATENT_W: 64
+  LATENT_H: 32
+  LATENT_W: 32
   VAE_CHECKPOINT: "checkpoints/vae.pt"
   VAE_RESUME: false
+  LORA_CHECKPOINT: "checkpoints/lora_unet"
+  LORA_RESUME: false
 
 # training config
 TRAINING:
-  BATCH_SIZE: 32
-  GRAD_ACCUM_STEPS: 2
+  BATCH_SIZE: 8
+  GRAD_ACCUM_STEPS: 8
+  MAX_GRAD_NORM: 1.0
   EPOCHS: 100
   LEARNING_RATE: 1e-5
+  LORA_R: 4
+  LORA_ALPHA: 16
+  LORA_DROPOUT: 0.1
   CONTEXT_DROPOUT_PROB: 0.1
   GUIDANCE_SCALE: 5
   BETA: 1
+  SSIM_WEIGHT: 0.0
   KL_MAX_WEIGHT: .1
   KL_ANNEAL_EPOCHS: 10
   WARMUP_EPOCHS: 20
   EARLY_STOP_PATIENCE: 50
   MIN_SAVE_EPOCH: 3
-  TRAIN_ON_ONE_BATCH: false # use this for debugging
+  TRAIN_ON_THREE_BATCHES: true # use this for debugging
   CHUNK_LIMIT: 1 # this limits the number of chunks loaded and trained on
 
   LR_SCHEDULER:
@@ -56,3 +63,4 @@ WANDB:
   PROJECT: "xray"
   RUN_NAME_VAE: "train_vae"
   RUN_NAME_DIFFUSION: "train_diffusion"
+  RUN_NAME_LORA_UNET: "train_lora_unet"

@@ -17,3 +17,4 @@ h5py
 scikit-image
 pytorch-msssim
 diffusers
+peft
