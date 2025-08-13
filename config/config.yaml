@@ -11,6 +11,7 @@ DATASET:
   MAX_REPORT_LENGTH: 128
   LIMIT_SAMPLES: null  # set to null or a number like 100 for quick tests
   NUM_CPUS: 8
+  STORE_SCALED_LATENTS: true
 
 # model config
 MODEL:
@@ -26,28 +27,31 @@ MODEL:
   VAE_RESUME: false
   LORA_CHECKPOINT: "checkpoints/lora_unet"
   LORA_RESUME: false
+  LATENT_SCALE: 0.18215
 
 # training config
 TRAINING:
   BATCH_SIZE: 8
-  GRAD_ACCUM_STEPS: 8
+  GRAD_ACCUM_STEPS: 32
   MAX_GRAD_NORM: 1.0
   EPOCHS: 100
-  LEARNING_RATE: 1e-5
-  LORA_R: 4
+  LEARNING_RATE: 5e-5
+  LORA_R: 16
   LORA_ALPHA: 16
-  LORA_DROPOUT: 0.1
-  CONTEXT_DROPOUT_PROB: 0.1
-  GUIDANCE_SCALE: 5
+  LORA_DROPOUT: 0
+  CFG_DROPOUT: 0.1
+  GUIDANCE_SCALE: 7.5
   BETA: 1
-  SSIM_WEIGHT: 0.0
+  SSIM_WEIGHT: 0.5
   KL_MAX_WEIGHT: .1
   KL_ANNEAL_EPOCHS: 10
   WARMUP_EPOCHS: 20
   EARLY_STOP_PATIENCE: 50
   MIN_SAVE_EPOCH: 3
-  TRAIN_ON_THREE_BATCHES: true # use this for debugging
+  TRAIN_ON_THREE_BATCHES: false # use this for debugging
   CHUNK_LIMIT: 1 # this limits the number of chunks loaded and trained on
+  DEBUG_PER_CHUNK_SAMPLES: 64       # keep only 64 samples from each chunk
+  DEBUG_MAX_GLOBAL_STEPS: 100  
 
   LR_SCHEDULER:
     TYPE: "ReduceLROnPlateau"
@@ -56,7 +60,7 @@ TRAINING:
     MIN_LR: 1e-7
 
 SCHEDULER:
-  SAMPLING_STEPS: 250
+  SAMPLING_STEPS: 1000
 
 # logging
 WANDB:
