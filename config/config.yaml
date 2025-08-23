@@ -25,8 +25,9 @@ MODEL:
   LATENT_W: 32
   VAE_CHECKPOINT: "checkpoints/vae.pt"
   VAE_RESUME: false
-  LORA_CHECKPOINT: "checkpoints/lora_unet"
-  LORA_RESUME: false
+  LORA_CHECKPOINT: "checkpoints/lora_unet/"
+  LORA_RESUME: true
+  LORA_RESUME_LOAD_OPT_STATE: false
   LATENT_SCALE: 0.18215
 
 # training config
@@ -36,28 +37,27 @@ TRAINING:
   MAX_GRAD_NORM: 1.0
   EPOCHS: 100
   LEARNING_RATE: 5e-5
+  TEXT_TOKENS: 8
   LORA_R: 16
   LORA_ALPHA: 16
-  LORA_DROPOUT: 0
-  CFG_DROPOUT: 0.1
+  LORA_DROPOUT: 0.05
+  CFG_DROPOUT: 0.05
   GUIDANCE_SCALE: 7.5
   BETA: 1
-  SSIM_WEIGHT: 0.5
+  SSIM_WEIGHT: 0
   KL_MAX_WEIGHT: .1
   KL_ANNEAL_EPOCHS: 10
   WARMUP_EPOCHS: 20
   EARLY_STOP_PATIENCE: 50
   MIN_SAVE_EPOCH: 3
   TRAIN_ON_THREE_BATCHES: false # use this for debugging
-  CHUNK_LIMIT: 1 # this limits the number of chunks loaded and trained on
-  DEBUG_PER_CHUNK_SAMPLES: 64       # keep only 64 samples from each chunk
-  DEBUG_MAX_GLOBAL_STEPS: 100  
+  CHUNK_LIMIT: 10 # this limits the number of chunks loaded and trained on
 
   LR_SCHEDULER:
     TYPE: "ReduceLROnPlateau"
-    PATIENCE: 3
-    FACTOR: 0.75
-    MIN_LR: 1e-7
+    PATIENCE: 5
+    FACTOR: 0.5
+    MIN_LR: 1e-6
 
 SCHEDULER:
   SAMPLING_STEPS: 1000
