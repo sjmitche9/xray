@@ -17,20 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ----------------- loss -----------------
-def composite_loss(pred, target, ssim_weight=0.0, beta=1.0):
-	sl1 = torch.nn.functional.smooth_l1_loss(pred, target, beta=beta)
-	if ssim_weight <= 0.0:
-		return sl1, sl1.item(), 0.0
-	with torch.no_grad():
-		pmn, pmx = pred.min(), pred.max()
-		tmn, tmx = target.min(), target.max()
-	pred_n = (pred - pmn) / (pmx - pmn + 1e-5)
-	targ_n = (target - tmn) / (tmx - tmn + 1e-5)
-	ssim_loss = 1.0 - ssim(pred_n, targ_n, data_range=1.0, size_average=True)
-	return sl1 + ssim_weight * ssim_loss, sl1.item(), ssim_loss.item()
-
-
 # ----------------- helpers -----------------
 def read_scale_from_meta(latent_dir):
 	try:
@@ -449,7 +435,7 @@ def main():
 	with open("config/config.yaml") as f:
 		config = yaml.safe_load(f)
 
-	accelerator = Accelerator()
+	accelerator = Accelerator(mixed_precision="bf16")
 	device = accelerator.device
 
 	# ---- config knobs ----
@@ -465,16 +451,11 @@ def main():
 	epochs = int(config["TRAINING"]["EPOCHS"])
 	guidance_scale = float(config["TRAINING"].get("GUIDANCE_SCALE", 7.5))  # inference-only
 	KTOK = int(config["TRAINING"].get("TEXT_TOKENS", 4))
-	# ---- high-t curriculum knobs (Option A) ----
-	HIGH_T_FRAC   = float(config["TRAINING"].get("HIGH_T_FRAC", 0.20))  # top 20% of timesteps
-	MIX_P_MAX     = float(config["TRAINING"].get("MIX_P_MAX", 0.30))    # up to 30% batches from high-t
-	WARMUP_EPOCHS = int(config["TRAINING"].get("WARMUP_EPOCHS", 4))     # ramp over 4 epochs
-	p_uncond = float(config["TRAINING"].get("CFG_DROPOUT", config["TRAINING"].get("CONTEXT_DROPOUT_PROB", 0.15)))
+	p_uncond = float(config["TRAINING"].get("CFG_DROPOUT", .05))
 	ckpt_root = config["MODEL"]["LORA_CHECKPOINT"]
 	resume_enabled = bool(config["MODEL"].get("LORA_RESUME", False))
 	resume_load_opt = bool(config["MODEL"].get("LORA_RESUME_LOAD_OPT_STATE", False))
 
-	# ---- text encoder (CPU, no grad) ----
 	tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
 	text_encoder = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT").to("cpu").eval()
 	for p in text_encoder.parameters():
@@ -493,7 +474,18 @@ def main():
 	lora_config = LoraConfig(
 		r=config["TRAINING"]["LORA_R"],
 		lora_alpha=config["TRAINING"]["LORA_ALPHA"],
-		target_modules=["to_q", "to_k", "to_v"],
+		target_modules=[
+			# attention
+			"to_q","to_k","to_v","to_out.0",
+			# spatial transformer 1x1
+			"proj_in","proj_out",
+			# spatial transformer FFN
+			"ff.net.0.proj","ff.net.2",
+			# UNet resnet convs
+			"conv1","conv2","conv_shortcut",
+			# time embedding MLP
+			"time_embedding.linear_1","time_embedding.linear_2",
+		],
 		lora_dropout=config["TRAINING"]["LORA_DROPOUT"],
 		bias="none",
 	)
@@ -536,20 +528,41 @@ def main():
 	scheduler = DDPMScheduler.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="scheduler")
 	scheduler.config.num_train_timesteps = 1000
 	scheduler.config.prediction_type = "epsilon"
-	scheduler = DDPMScheduler.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="scheduler")
-	scheduler.set_timesteps(100, device=device)
+	scheduler.set_timesteps(500, device=device)
 	accelerator.print(
 		f"[scheduler] beta_schedule={getattr(scheduler.config,'beta_schedule',None)} "
 		f"num_train_timesteps={scheduler.config.num_train_timesteps} "
 		f"prediction_type={scheduler.config.prediction_type}"
 	)
 
-	# ---- optimizer & LR schedule ----
+	# --- allow context_proj to learn
+	for p in accelerator.unwrap_model(unet).context_proj.parameters():
+		p.requires_grad = True
+
+	# --- split parameter groups: LoRA vs context_proj
+	base = accelerator.unwrap_model(unet)
+	lora_params, ctx_params = [], []
+	for n, p in base.named_parameters():
+		if not p.requires_grad:
+			continue
+		if n.startswith("context_proj."):
+			ctx_params.append(p)
+		else:
+			# trainable LoRA adapters have "lora" in their names (peft)
+			if "lora" in n.lower():
+				lora_params.append(p)
+
 	optimizer = torch.optim.AdamW(
-		unet.parameters(),
-		lr=float(config["TRAINING"]["LEARNING_RATE"]),
-		weight_decay=0.0,  # keep 0 for LoRA
+		[
+			{"params": lora_params, "lr": float(config["TRAINING"]["LEARNING_RATE"]), "weight_decay": 0.0},
+			{"params": ctx_params,  "lr": 1e-5, "weight_decay": 1e-4},
+		],
+		betas=(0.9, 0.999),
+		eps=1e-8,
+		weight_decay=0.0,
 	)
+
+
 	lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 		optimizer,
 		mode="min",
@@ -620,19 +633,11 @@ def main():
 
 				z = batch["z_target"].to(device).float().contiguous(memory_format=torch.channels_last)
 				reports = batch["report"]
-				noise = torch.randn_like(z)
 				
-				# Mixture sampler: mostly uniform, sometimes sample only high-t (ramped in over epochs)
 				T = scheduler.config.num_train_timesteps
 				B = z.size(0)
-				p = MIX_P_MAX * min(1.0, (epoch + 1) / WARMUP_EPOCHS)  # ramp 0 -> MIX_P_MAX
-				k0 = int((1.0 - HIGH_T_FRAC) * T)                      # start of top-t slice
-				if torch.rand((), device=device) < p:
-					t = torch.randint(k0, T, (B,), device=device)      # high-t slice
-				else:
-					t = torch.randint(0,  T, (B,), device=device)      # uniform full range
-
-
+				t = torch.randint(0, T, (B,), device=device)        # uniform over [0, T)
+				noise = torch.randn_like(z)
 				z_noisy = scheduler.add_noise(z, noise, t).contiguous(memory_format=torch.channels_last)
 
 				# ---- CPU tokenize + encode, reduce to KTOK ----
@@ -680,7 +685,7 @@ def main():
 
 				with torch.no_grad():
 					train_pred_std_sum += float(pred.float().std().item())
-					train_cos_sum += float(F.cosine_similarity(pred.flatten(1), noise.flatten(1)).mean().item())
+					train_cos_sum += float(F.cosine_similarity(pred.float().flatten(1), noise.float().flatten(1)).mean().item())
 
 				step_now = ((i + 1) % grad_accum_steps == 0) or ((i + 1) == len(loader))
 				if step_now:
@@ -728,7 +733,7 @@ def main():
 		used_ema = True
 
 		unet.eval()
-		val_loss = val_l1_total = val_ssim_total = 0.0
+		val_loss_total = 0.0
 		val_batches = 0
 		val_images = []
 		cfg_images = []
@@ -776,15 +781,13 @@ def main():
 				)
 
 				pred = unet(z_noisy, t_infer, ctx).sample
-				loss, sl1_val_each, ssim_val_each = composite_loss(pred, noise, ssim_weight=ssim_weight, beta=beta)
+				val_sl1 = F.smooth_l1_loss(pred, noise, beta=beta)
 
-				val_loss += loss.item()
-				val_l1_total += sl1_val_each
-				val_ssim_total += ssim_val_each
+				val_loss_total += val_sl1.item()
 				val_batches += 1
 
 				val_pred_std_sum += float(pred.float().std().item())
-				val_cos_sum += float(F.cosine_similarity(pred.flatten(1), noise.flatten(1)).mean().item())
+				val_cos_sum += float(F.cosine_similarity(pred.float().flatten(1), noise.float().flatten(1)).mean().item())
 				t_vals += [int(x) for x in t_infer.tolist()]
 
 				if "length" in tokens:
@@ -876,7 +879,7 @@ def main():
 						val_images.append(
 							wandb.Image(
 								panel,
-								caption=f"[{k+1}/3] decoded(z)\nfull diffusion\n(from t={int(t_k_val.item())})\n{rep_k}",
+								caption=f"decoded(z) full diff (from t={int(t_k_val.item())})\n{rep_k}",
 							)
 						)
 
@@ -906,12 +909,10 @@ def main():
 						cfg_images.append(wandb.Image(img, caption=f"CFG s={guidance_scale} | {reports[j]}"))
 					del sample_imgs
 
-				del z, reports, noise, t_infer, z_noisy, tokens, ctx, pred, loss
+				del z, reports, noise, t_infer, z_noisy, tokens, ctx, pred, val_sl1
 				torch.cuda.empty_cache()
 
-		avg_val_loss = val_loss / max(1, val_batches)
-		avg_val_l1 = val_l1_total / max(1, val_batches)
-		avg_val_ssim = val_ssim_total / max(1, val_batches)
+		avg_val_loss = val_loss_total / max(1, val_batches)
 		avg_val_pred_std = val_pred_std_sum / max(1, val_batches) if val_batches else 0.0
 		avg_val_cos = val_cos_sum / max(1, val_batches) if val_batches else 0.0
 
@@ -929,12 +930,9 @@ def main():
 
 		log_data = {
 			"model/epoch": epoch + 1,
-			"model/lr": optimizer.param_groups[0]["lr"],
 			"train/cfg_drop_ratio": avg_drop_ratio,
 			"train/loss": avg_train_loss,
 			"val/loss": avg_val_loss,
-			"val/smooth_l1": avg_val_l1,
-			"val/ssim_loss": avg_val_ssim,
 			"train/pred_std": avg_train_pred_std,
 			"val/pred_std": avg_val_pred_std,
 			"train/cos_pred_noise": avg_train_cos,
@@ -952,8 +950,11 @@ def main():
 			"images/cfg_samples": cfg_images,
 			"val/recon_psnr_mean": (sum(pair_psnrs) / len(pair_psnrs)) if pair_psnrs else 0.0,
 			"val/recon_ssim_mean": (sum(pair_ssims) / len(pair_ssims)) if pair_ssims else 0.0,
-			"eval/used_ema": int(used_ema),
+			"val/used_ema": int(used_ema),
 		}
+		log_data["train/lr_ctx"]  = optimizer.param_groups[1]["lr"]
+		log_data["train/lr_lora"] = optimizer.param_groups[0]["lr"]
+		log_data.update(cfg_log)
 		wandb.log(log_data)
 		accelerator.print(f"[val]   epoch {epoch+1}: avg_val_loss={avg_val_loss:.5f} used_ema={used_ema}")
 
