@@ -26,18 +26,18 @@ MODEL:
   VAE_CHECKPOINT: "checkpoints/vae.pt"
   VAE_RESUME: false
   LORA_CHECKPOINT: "checkpoints/lora_unet/"
-  LORA_RESUME: false
+  LORA_RESUME: true
   LORA_RESUME_LOAD_OPT_STATE: false
   LATENT_SCALE: 0.18215
 
 # training config
 TRAINING:
-  BATCH_SIZE: 4
-  GRAD_ACCUM_STEPS: 64
+  BATCH_SIZE: 2
+  GRAD_ACCUM_STEPS: 128
   MAX_GRAD_NORM: 1.0
   EPOCHS: 200
   LEARNING_RATE: 2e-5
-  TEXT_TOKENS: 8
+  TEXT_TOKENS: 16 # this is now saved with the latent dataset
   LORA_R: 64
   LORA_ALPHA: 64
   LORA_DROPOUT: 0.05
@@ -51,7 +51,7 @@ TRAINING:
   EARLY_STOP_PATIENCE: 50
   MIN_SAVE_EPOCH: 3
   TRAIN_ON_THREE_BATCHES: false # use this for debugging
-  CHUNK_LIMIT: 1 # this limits the number of chunks loaded and trained on (max 36)
+  CHUNK_LIMIT: 10 # this limits the number of chunks loaded and trained on (max 36)
 
   LR_SCHEDULER:
     TYPE: "ReduceLROnPlateau"

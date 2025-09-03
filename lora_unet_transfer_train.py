@@ -560,6 +560,7 @@ def main():
 		betas=(0.9, 0.999),
 		eps=1e-8,
 		weight_decay=0.0,
+		fused=True
 	)
 
 
@@ -624,7 +625,7 @@ def main():
 			if not os.path.exists(chunk_path) or chunk_id >= chunk_limit:
 				break
 
-			dataset = load_from_disk(chunk_path).with_format("torch", columns=["z_target", "report"])
+			dataset = load_from_disk(chunk_path).with_format("torch", columns=["z_target", "report", "ctx16"])
 			loader = accelerator.prepare(DataLoader(dataset, batch_size=batch_size, shuffle=True))
 
 			for i, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch+1} Chunk {chunk_id}")):
@@ -640,23 +641,33 @@ def main():
 				noise = torch.randn_like(z)
 				z_noisy = scheduler.add_noise(z, noise, t).contiguous(memory_format=torch.channels_last)
 
+				tokens = None
+				outputs = None
+				ctx_full = None
+				unet_dtype = next(unet.parameters()).dtype
+
+				if "ctx16" in batch:
+					ctx16 = batch["ctx16"].to(device=device, dtype=unet_dtype, non_blocking=True)  # [B,16,768]
+					idx = torch.linspace(0, 15, steps=KTOK, device=device).round().long()
+					ctx_cond = ctx16[:, idx, :]
+				else:
 				# ---- CPU tokenize + encode, reduce to KTOK ----
-				tokens = tokenizer(
-					list(reports),
-					padding="longest",
-					truncation=True,
-					max_length=64,
-					return_tensors="pt",
-					return_length=True,
-				)
-				bert_inputs = {k: tokens[k] for k in ("input_ids", "attention_mask", "token_type_ids", "length") if k in tokens}
-				with torch.no_grad():
-					outputs = text_encoder(**{k: bert_inputs[k] for k in bert_inputs if k != "length"})
-				ctx_full = outputs.last_hidden_state
-				attn = bert_inputs.get("attention_mask", None)
-				ctx_cond = select_k_tokens(ctx_full, attn, k=KTOK).to(
-					device=device, dtype=next(unet.parameters()).dtype, non_blocking=True
-				)
+					tokens = tokenizer(
+						list(reports),
+						padding="longest",
+						truncation=True,
+						max_length=64,
+						return_tensors="pt",
+						return_length=True,
+					)
+					bert_inputs = {k: tokens[k] for k in ("input_ids", "attention_mask", "token_type_ids", "length") if k in tokens}
+					with torch.no_grad():
+						outputs = text_encoder(**{k: bert_inputs[k] for k in bert_inputs if k != "length"})
+					ctx_full = outputs.last_hidden_state
+					attn = bert_inputs.get("attention_mask", None)
+					ctx_cond = select_k_tokens(ctx_full, attn, k=KTOK).to(
+						device=device, dtype=next(unet.parameters()).dtype, non_blocking=True
+					)
 
 				# ---- unconditional context from precomputed null -> mean then repeat to KTOK
 				B = ctx_cond.size(0)
@@ -701,10 +712,12 @@ def main():
 				epoch_loss += loss.item() * grad_accum_steps
 				num_batches += 1
 
-				if "length" in tokens:
-					train_tok_lens += [int(x) for x in tokens["length"]]
-				elif "attention_mask" in tokens:
-					train_tok_lens += [int(m.sum().item()) for m in tokens["attention_mask"]]
+				if isinstance(tokens, dict):
+					if "length" in tokens:
+						train_tok_lens += [int(x) for x in tokens["length"]]
+					elif "attention_mask" in tokens:
+						train_tok_lens += [int(m.sum().item()) for m in tokens["attention_mask"]]
+
 
 				del z, reports, noise, t, z_noisy, tokens, outputs, ctx_full, ctx_cond, ctx_uncond, pred, loss
 				torch.cuda.empty_cache()
@@ -724,7 +737,7 @@ def main():
 		val_decode_scale = read_scale_from_meta(val_path) or SCALE
 		preview_scale = read_scale_from_meta(val_path) or SCALE
 		accelerator.print(f"[val] decode scales: preview={preview_scale}  cfg={val_decode_scale}")
-		val_dataset = load_from_disk(val_path).with_format("torch", columns=["z_target", "report"])
+		val_dataset = load_from_disk(val_path).with_format("torch", columns=["z_target", "report", "ctx16"])
 		val_loader = accelerator.prepare(DataLoader(val_dataset, batch_size=batch_size))
 
 		# Always evaluate/sampling with EMA weights
@@ -763,22 +776,30 @@ def main():
 				noise = make_deterministic_noise(shape=z.shape, device=z.device, dtype=z.dtype, seed=12345 + epoch * 100_000 + i)
 				z_noisy = scheduler.add_noise(z, noise, t_infer)
 
-				# encode (CPU) and select tokens
-				tokens = tokenizer(
-					list(reports),
-					padding="longest",
-					truncation=True,
-					max_length=64,
-					return_tensors="pt",
-					return_length=True,
-				)
-				bert_inputs = {k: tokens[k] for k in ("input_ids", "attention_mask", "token_type_ids", "length") if k in tokens}
-				outputs = text_encoder(**{k: bert_inputs[k] for k in bert_inputs if k != "length"})
-				ctx_full = outputs.last_hidden_state
-				attn = bert_inputs.get("attention_mask", None)
-				ctx = select_k_tokens(ctx_full, attn, k=KTOK).to(
-					device=device, dtype=next(unet.parameters()).dtype, non_blocking=True
-				)
+				tokens = None
+				unet_dtype = next(unet.parameters()).dtype
+
+				if "ctx16" in batch:
+					ctx16 = batch["ctx16"].to(device=device, dtype=unet_dtype, non_blocking=True)  # [B,16,768]
+					idx = torch.linspace(0, 15, steps=KTOK, device=device).round().long()
+					ctx = ctx16[:, idx, :]
+				else:
+					# encode (CPU) and select tokens
+					tokens = tokenizer(
+						list(reports),
+						padding="longest",
+						truncation=True,
+						max_length=64,
+						return_tensors="pt",
+						return_length=True,
+					)
+					bert_inputs = {k: tokens[k] for k in ("input_ids", "attention_mask", "token_type_ids", "length") if k in tokens}
+					outputs = text_encoder(**{k: bert_inputs[k] for k in bert_inputs if k != "length"})
+					ctx_full = outputs.last_hidden_state
+					attn = bert_inputs.get("attention_mask", None)
+					ctx = select_k_tokens(ctx_full, attn, k=KTOK).to(
+						device=device, dtype=next(unet.parameters()).dtype, non_blocking=True
+					)
 
 				pred = unet(z_noisy, t_infer, ctx).sample
 				val_sl1 = F.smooth_l1_loss(pred, noise, beta=beta)
@@ -790,10 +811,12 @@ def main():
 				val_cos_sum += float(F.cosine_similarity(pred.float().flatten(1), noise.float().flatten(1)).mean().item())
 				t_vals += [int(x) for x in t_infer.tolist()]
 
-				if "length" in tokens:
-					val_tok_lens += [int(x) for x in tokens["length"]]
-				elif "attention_mask" in tokens:
-					val_tok_lens += [int(m.sum().item()) for m in tokens["attention_mask"]]
+				if isinstance(tokens, dict):
+					if "length" in tokens:
+						val_tok_lens += [int(x) for x in tokens["length"]]
+					elif "attention_mask" in tokens:
+						val_tok_lens += [int(m.sum().item()) for m in tokens["attention_mask"]]
+
 
 				# --- CFG diagnostics (first val batch only) ---
 				if i == 0:
