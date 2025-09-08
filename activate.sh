@@ -1,1 +1,1 @@
-source env_trader/bin/activate
+source env_xray/bin/activate
