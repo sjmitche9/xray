@@ -41,17 +41,17 @@ TRAINING:
   LORA_R: 64
   LORA_ALPHA: 64
   LORA_DROPOUT: 0.05
-  CFG_DROPOUT: 0
-  GUIDANCE_SCALE: 3
+  CFG_DROPOUT: 0.05
+  GUIDANCE_SCALE: 1
   BETA: 1
-  SSIM_WEIGHT: 0
+  SSIM_WEIGHT: 0.1
   KL_MAX_WEIGHT: .1
   KL_ANNEAL_EPOCHS: 10
-  WARMUP_EPOCHS: 20
+  WARMUP_EPOCHS: 10
   EARLY_STOP_PATIENCE: 50
   MIN_SAVE_EPOCH: 3
   TRAIN_ON_THREE_BATCHES: false # use this for debugging
-  CHUNK_LIMIT: 10 # this limits the number of chunks loaded and trained on (max 36)
+  CHUNK_LIMIT: 36 # this limits the number of chunks loaded and trained on (max 36)
 
   LR_SCHEDULER:
     TYPE: "ReduceLROnPlateau"

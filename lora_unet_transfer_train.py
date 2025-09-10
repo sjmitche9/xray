@@ -17,6 +17,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def composite_loss(pred, target, ssim_weight=0.0, beta=1.0):
+    # Smooth L1 loss
+    sl1 = F.smooth_l1_loss(pred, target, beta=beta)
+
+    # Normalize before SSIM to keep values in [0,1]
+    pred_norm = (pred - pred.min()) / (pred.max() - pred.min() + 1e-5)
+    target_norm = (target - target.min()) / (target.max() - target.min() + 1e-5)
+
+    # SSIM loss
+    ssim_loss = 1.0 - ssim(pred_norm, target_norm, data_range=1.0, size_average=True)
+
+    # Weighted sum
+    total_loss = sl1 + ssim_weight * ssim_loss
+    return total_loss, sl1.item(), ssim_loss.item()
+
+
 # ----------------- helpers -----------------
 def read_scale_from_meta(latent_dir):
 	try:
@@ -455,6 +471,7 @@ def main():
 	ckpt_root = config["MODEL"]["LORA_CHECKPOINT"]
 	resume_enabled = bool(config["MODEL"].get("LORA_RESUME", False))
 	resume_load_opt = bool(config["MODEL"].get("LORA_RESUME_LOAD_OPT_STATE", False))
+	warmup_epochs = int(config["TRAINING"].get("WARMUP_EPOCHS", 5))
 
 	tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
 	text_encoder = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT").to("cpu").eval()
@@ -491,6 +508,7 @@ def main():
 	)
 	unet_lora = get_peft_model(unet_base, lora_config)
 	unet = LoRAUNetWrapper(unet_lora, context_dim_in=768, context_dim_out=768).to(device)
+	
 
 	# --- identity context_proj if effectively uninitialized ---
 	with torch.no_grad():
@@ -586,6 +604,8 @@ def main():
 		start_epoch, best_val_loss, patience_counter, ema_ready, ckpt_dir = _try_resume(
 			accelerator, unet, optimizer, lr_scheduler, ema, ckpt_root, load_opt_state=resume_load_opt
 		)
+		if not resume_load_opt:
+			start_epoch = 0
 	else:
 		start_epoch, best_val_loss, patience_counter, ckpt_dir = 0, float("inf"), 0, None
 		with torch.no_grad():
@@ -626,7 +646,7 @@ def main():
 				break
 
 			dataset = load_from_disk(chunk_path).with_format("torch", columns=["z_target", "report", "ctx16"])
-			loader = accelerator.prepare(DataLoader(dataset, batch_size=batch_size, shuffle=True))
+			loader = accelerator.prepare(DataLoader(dataset, batch_size=batch_size, pin_memory=True, shuffle=True))
 
 			for i, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch+1} Chunk {chunk_id}")):
 				if train_on_three and i == 3:
@@ -690,7 +710,9 @@ def main():
 						observed_drop.extend([0.0] * B)
 
 					pred = unet(z_noisy, t, ctx_train).sample
-					loss = F.smooth_l1_loss(pred, noise, beta=beta) / grad_accum_steps
+					# loss = F.smooth_l1_loss(pred, noise, beta=beta) / grad_accum_steps
+					loss, _, _ = composite_loss(pred, noise, ssim_weight=ssim_weight, beta=beta)
+					loss /= grad_accum_steps
 
 				accelerator.backward(loss)
 
@@ -746,7 +768,7 @@ def main():
 		used_ema = True
 
 		unet.eval()
-		val_loss_total = 0.0
+		val_loss_total, val_sl1_loss_total, val_ssim_loss_total = 0.0, 0.0, 0.0
 		val_batches = 0
 		val_images = []
 		cfg_images = []
@@ -802,9 +824,16 @@ def main():
 					)
 
 				pred = unet(z_noisy, t_infer, ctx).sample
-				val_sl1 = F.smooth_l1_loss(pred, noise, beta=beta)
+				# val_sl1 = F.smooth_l1_loss(pred, noise, beta=beta)
+				val_loss, val_sl1_loss, val_ssim_loss = composite_loss(pred, noise, ssim_weight=ssim_weight, beta=beta)
+				val_loss /= grad_accum_steps
+				val_sl1_loss /= grad_accum_steps
+				val_ssim_loss /= grad_accum_steps
 
-				val_loss_total += val_sl1.item()
+				# val_loss_total += val_sl1.item()
+				val_loss_total += val_loss.item()
+				val_sl1_loss_total += val_sl1_loss
+				val_ssim_loss_total += val_ssim_loss
 				val_batches += 1
 
 				val_pred_std_sum += float(pred.float().std().item())
@@ -932,10 +961,12 @@ def main():
 						cfg_images.append(wandb.Image(img, caption=f"CFG s={guidance_scale} | {reports[j]}"))
 					del sample_imgs
 
-				del z, reports, noise, t_infer, z_noisy, tokens, ctx, pred, val_sl1
+				del z, reports, noise, t_infer, z_noisy, tokens, ctx, pred, val_loss, val_sl1_loss, val_ssim_loss
 				torch.cuda.empty_cache()
 
 		avg_val_loss = val_loss_total / max(1, val_batches)
+		avg_val_sl1_loss = val_sl1_loss_total / max(1, val_batches)
+		avg_val_ssim_loss = val_ssim_loss_total / max(1, val_batches)
 		avg_val_pred_std = val_pred_std_sum / max(1, val_batches) if val_batches else 0.0
 		avg_val_cos = val_cos_sum / max(1, val_batches) if val_batches else 0.0
 
@@ -956,6 +987,8 @@ def main():
 			"train/cfg_drop_ratio": avg_drop_ratio,
 			"train/loss": avg_train_loss,
 			"val/loss": avg_val_loss,
+			"val/sl1_loss": avg_val_sl1_loss,
+			"val_ssim_loss": avg_val_ssim_loss,
 			"train/pred_std": avg_train_pred_std,
 			"val/pred_std": avg_val_pred_std,
 			"train/cos_pred_noise": avg_train_cos,
@@ -981,9 +1014,11 @@ def main():
 		wandb.log(log_data)
 		accelerator.print(f"[val]   epoch {epoch+1}: avg_val_loss={avg_val_loss:.5f} used_ema={used_ema}")
 
-		lr_scheduler.step(avg_val_loss)
-		if used_ema:
-			ema.restore(unet)
+		if epoch >= warmup_epochs:
+
+			lr_scheduler.step(avg_val_loss)
+			if used_ema:
+				ema.restore(unet)
 
 		# save best (EMA + state) + rolling checkpoints
 		if epoch == start_epoch or avg_val_loss < best_val_loss:
