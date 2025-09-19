@@ -13,6 +13,7 @@ from diffusers import UNet2DConditionModel, DDPMScheduler, AutoencoderKL
 from peft import get_peft_model, LoraConfig
 from accelerate import Accelerator
 from pytorch_msssim import ssim
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -133,7 +134,7 @@ def sample_from_model(
 	reports,
 	guidance_scale=7.5,
 	scale=0.18215,
-	KTOK=4,
+	KTOK=16,
 	batched_cfg=False,
 ):
 	"""
@@ -466,7 +467,7 @@ def main():
 	beta = config["TRAINING"].get("BETA", 1.0)
 	epochs = int(config["TRAINING"]["EPOCHS"])
 	guidance_scale = float(config["TRAINING"].get("GUIDANCE_SCALE", 7.5))  # inference-only
-	KTOK = int(config["TRAINING"].get("TEXT_TOKENS", 4))
+	KTOK = int(config["TRAINING"].get("TEXT_TOKENS", 16))
 	p_uncond = float(config["TRAINING"].get("CFG_DROPOUT", .05))
 	ckpt_root = config["MODEL"]["LORA_CHECKPOINT"]
 	resume_enabled = bool(config["MODEL"].get("LORA_RESUME", False))
@@ -544,14 +545,20 @@ def main():
 
 	# ---- noise scheduler ----
 	scheduler = DDPMScheduler.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="scheduler")
-	scheduler.config.num_train_timesteps = 1000
+	scheduler.config.num_train_timesteps = config["SCHEDULER"]["SAMPLING_STEPS"]
 	scheduler.config.prediction_type = "epsilon"
-	scheduler.set_timesteps(500, device=device)
+	scheduler.set_timesteps(config["SCHEDULER"]["INFERENCE_STEPS"], device=device)
 	accelerator.print(
 		f"[scheduler] beta_schedule={getattr(scheduler.config,'beta_schedule',None)} "
 		f"num_train_timesteps={scheduler.config.num_train_timesteps} "
 		f"prediction_type={scheduler.config.prediction_type}"
 	)
+
+	# Validation timesteps sampled from the full training horizon (1000 steps)
+	train_T = scheduler.config.num_train_timesteps
+	val_steps = config["SCHEDULER"]["INFERENCE_STEPS"]  # e.g. 100
+	fixed_t = torch.linspace(0, train_T - 1, steps=val_steps, device=device).long()
+
 
 	# --- allow context_proj to learn
 	for p in accelerator.unwrap_model(unet).context_proj.parameters():
@@ -620,10 +627,11 @@ def main():
 		accelerator.print(f"[resume] dir={ckpt_dir}")
 	accelerator.print(f"epochs={epochs}  batch_size={batch_size}  lr={optimizer.param_groups[0]['lr']}")
 
-	# ---- deterministic validation setup ----
 	val_gen = torch.Generator(device=device).manual_seed(42)
-	fixed_t_idx = torch.linspace(0, len(scheduler.timesteps) - 1, steps=50, device=device).long()
-	fixed_t = scheduler.timesteps[fixed_t_idx]
+
+	p_noise_max = 0.5
+	ramp_frac = 0.6                # ramp over first 60% of epochs, then hold at p_noise_max
+
 
 	# -------- training loop --------
 	for epoch in range(start_epoch, epochs):
@@ -652,14 +660,29 @@ def main():
 				if train_on_three and i == 3:
 					break
 
-				z = batch["z_target"].to(device).float().contiguous(memory_format=torch.channels_last)
 				reports = batch["report"]
 				
+				z_dataset = batch["z_target"].to(device).float().contiguous(memory_format=torch.channels_last)
+
+				# progress in [0,1]
+				ramp_epochs = max(1, int(ramp_frac * epochs))
+				progress    = min(1.0, epoch / max(1, ramp_epochs - 1))
+
+				p_noise = p_noise_max * progress  # current probability of replacing with noise
+				# -------------------------------------------------------------------
+
+				# Per-sample mixing: each latent in batch is dataset or random noise
+				B = z_dataset.size(0)
+				mask = (torch.rand(B, device=device) < p_noise).view(B, *([1] * (z_dataset.ndim - 1)))
+				z_random = torch.randn_like(z_dataset)
+				z = torch.where(mask, z_random, z_dataset)
+
+				# Continue with existing noise addition and timestep sampling
 				T = scheduler.config.num_train_timesteps
-				B = z.size(0)
-				t = torch.randint(0, T, (B,), device=device)        # uniform over [0, T)
+				t = torch.randint(0, T, (B,), device=device)  # uniform over [0, T)
 				noise = torch.randn_like(z)
 				z_noisy = scheduler.add_noise(z, noise, t).contiguous(memory_format=torch.channels_last)
+
 
 				tokens = None
 				outputs = None
@@ -824,13 +847,8 @@ def main():
 					)
 
 				pred = unet(z_noisy, t_infer, ctx).sample
-				# val_sl1 = F.smooth_l1_loss(pred, noise, beta=beta)
 				val_loss, val_sl1_loss, val_ssim_loss = composite_loss(pred, noise, ssim_weight=ssim_weight, beta=beta)
-				val_loss /= grad_accum_steps
-				val_sl1_loss /= grad_accum_steps
-				val_ssim_loss /= grad_accum_steps
 
-				# val_loss_total += val_sl1.item()
 				val_loss_total += val_loss.item()
 				val_sl1_loss_total += val_sl1_loss
 				val_ssim_loss_total += val_ssim_loss
@@ -956,13 +974,16 @@ def main():
 						KTOK=KTOK,
 						batched_cfg=False,
 					)
+
 					for j in range(N):
 						img = to_grayscale(sample_imgs[j].detach().cpu())
 						cfg_images.append(wandb.Image(img, caption=f"CFG s={guidance_scale} | {reports[j]}"))
 					del sample_imgs
 
+
 				del z, reports, noise, t_infer, z_noisy, tokens, ctx, pred, val_loss, val_sl1_loss, val_ssim_loss
 				torch.cuda.empty_cache()
+
 
 		avg_val_loss = val_loss_total / max(1, val_batches)
 		avg_val_sl1_loss = val_sl1_loss_total / max(1, val_batches)
@@ -986,9 +1007,10 @@ def main():
 			"model/epoch": epoch + 1,
 			"train/cfg_drop_ratio": avg_drop_ratio,
 			"train/loss": avg_train_loss,
+			"train/p_noise": float(p_noise),
 			"val/loss": avg_val_loss,
 			"val/sl1_loss": avg_val_sl1_loss,
-			"val_ssim_loss": avg_val_ssim_loss,
+			"val/ssim_loss": avg_val_ssim_loss,
 			"train/pred_std": avg_train_pred_std,
 			"val/pred_std": avg_val_pred_std,
 			"train/cos_pred_noise": avg_train_cos,

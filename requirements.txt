@@ -18,3 +18,4 @@ scikit-image
 pytorch-msssim
 diffusers
 peft
+streamlit

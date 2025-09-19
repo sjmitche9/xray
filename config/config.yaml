@@ -26,6 +26,7 @@ MODEL:
   VAE_CHECKPOINT: "checkpoints/vae.pt"
   VAE_RESUME: false
   LORA_CHECKPOINT: "checkpoints/lora_unet/"
+  LORA_CHECKPOINT_NAME: "best"
   LORA_RESUME: true
   LORA_RESUME_LOAD_OPT_STATE: false
   LATENT_SCALE: 0.18215
@@ -40,18 +41,18 @@ TRAINING:
   TEXT_TOKENS: 16 # this is now saved with the latent dataset
   LORA_R: 64
   LORA_ALPHA: 64
-  LORA_DROPOUT: 0.05
+  LORA_DROPOUT: 0.1
   CFG_DROPOUT: 0.05
-  GUIDANCE_SCALE: 1
+  GUIDANCE_SCALE: 3
   BETA: 1
   SSIM_WEIGHT: 0.1
   KL_MAX_WEIGHT: .1
   KL_ANNEAL_EPOCHS: 10
-  WARMUP_EPOCHS: 10
+  WARMUP_EPOCHS: 5
   EARLY_STOP_PATIENCE: 50
   MIN_SAVE_EPOCH: 3
-  TRAIN_ON_THREE_BATCHES: false # use this for debugging
-  CHUNK_LIMIT: 36 # this limits the number of chunks loaded and trained on (max 36)
+  TRAIN_ON_THREE_BATCHES: true # use this for debugging
+  CHUNK_LIMIT: 1 # this limits the number of chunks loaded and trained on (max 36)
 
   LR_SCHEDULER:
     TYPE: "ReduceLROnPlateau"
@@ -61,6 +62,7 @@ TRAINING:
 
 SCHEDULER:
   SAMPLING_STEPS: 1000
+  INFERENCE_STEPS: 100
 
 # logging
 WANDB:
@@ -68,3 +70,6 @@ WANDB:
   RUN_NAME_VAE: "train_vae"
   RUN_NAME_DIFFUSION: "train_diffusion"
   RUN_NAME_LORA_UNET: "train_lora_unet"
+
+INFERENCE:
+  DEFAULT_REPORT: "cardiomegaly, edema, view: ap"
