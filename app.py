@@ -8,21 +8,27 @@ from models.lora_unet_wrapper import LoRAUNetWrapper
 import yaml
 import os
 
+latent_stats_file = "data/processed_dataset/latent/dataset_latent_stats.pt"
+latent_stats = torch.load(latent_stats_file, map_location="cuda")
+mean_latent = latent_stats["mean"].to("cuda")
+std_latent = latent_stats["std"].to("cuda")
+
+
 def load_config(path="config/config.yaml"):
-    """
-    Load YAML config and return as dict.
-    Raises an error if file is missing or malformed.
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Config file not found: {path}")
-    
-    with open(path, "r") as f:
-        config = yaml.safe_load(f)
-    
-    if not isinstance(config, dict):
-        raise ValueError("Config file did not parse as a dictionary.")
-    
-    return config
+	"""
+	Load YAML config and return as dict.
+	Raises an error if file is missing or malformed.
+	"""
+	if not os.path.exists(path):
+		raise FileNotFoundError(f"Config file not found: {path}")
+	
+	with open(path, "r") as f:
+		config = yaml.safe_load(f)
+	
+	if not isinstance(config, dict):
+		raise ValueError("Config file did not parse as a dictionary.")
+	
+	return config
 
 
 # Example usage:
@@ -116,7 +122,7 @@ def load_models(KTOK=16, device="cuda"):
 	)
 	unet_lora = get_peft_model(unet_base, lora_config)
 	unet = LoRAUNetWrapper(unet_lora, context_dim_in=768, context_dim_out=768).to(device)
-	unet.unet.load_adapter(lora_ckpt, adapter_name="default", is_trainable=False)
+	unet.unet.load_adapter(os.path.abspath(lora_ckpt), adapter_name="default", is_trainable=False)
 
 	# VAE
 	vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
@@ -129,52 +135,71 @@ def load_models(KTOK=16, device="cuda"):
 
 	return tokenizer, text_encoder, unet, vae, scheduler, null_ctx_cpu
 
+
 @torch.no_grad()
 def sample_single(
-	unet, vae, tokenizer, text_encoder, scheduler, device,
-	prompt: str, guidance_scale: float = 7.5, KTOK: int = 16, scale: float = 0.18215
+    unet,
+    vae,
+    tokenizer,
+    text_encoder,
+    scheduler,
+    device,
+    prompt: str,
+    mean_latent,
+    std_latent,
+    alpha: float = 0.3,      # 0 = mostly dataset latent, 1 = fully random
+    guidance_scale: float = 7.5,
+    KTOK: int = 16,
+    scale: float = 0.18215,
 ):
-	# --- tokenize and encode ---
-	tokens = tokenizer([prompt], padding="longest", truncation=True, max_length=64, return_tensors="pt")
-	bert_inputs = {k: tokens[k] for k in ("input_ids", "attention_mask", "token_type_ids") if k in tokens}
-	outputs = text_encoder(**bert_inputs)
-	ctx_full = outputs.last_hidden_state
-	attn = bert_inputs.get("attention_mask", None)
-	model_dtype = next(unet.parameters()).dtype
-	ctx_cond = select_k_tokens(ctx_full, attn, k=KTOK).to(device=device, dtype=model_dtype, non_blocking=True)
+    # --- text encoding ---
+    tokens = tokenizer([prompt], padding="longest", truncation=True, max_length=64, return_tensors="pt")
+    bert_inputs = {k: tokens[k] for k in ("input_ids", "attention_mask", "token_type_ids") if k in tokens}
+    outputs = text_encoder(**bert_inputs)
+    ctx_full = outputs.last_hidden_state
+    attn = bert_inputs.get("attention_mask", None)
+    model_dtype = next(unet.parameters()).dtype
+    ctx_cond = select_k_tokens(ctx_full, attn, k=KTOK).to(device=device, dtype=model_dtype, non_blocking=True)
 
-	# --- unconditional context ---
-	null_tokens = tokenizer([""], padding="longest", truncation=True, max_length=64, return_tensors="pt")
-	null_inputs = {k: null_tokens[k] for k in ("input_ids", "attention_mask", "token_type_ids") if k in null_tokens}
-	null_ctx = text_encoder(**null_inputs).last_hidden_state
-	base_null = null_ctx.mean(dim=1, keepdim=True)
-	ctx_uncond = base_null.expand(ctx_cond.size(0), KTOK, base_null.size(-1)).to(device=device, dtype=model_dtype)
+    # --- unconditional context ---
+    null_tokens = tokenizer([""], padding="longest", truncation=True, max_length=64, return_tensors="pt")
+    null_inputs = {k: null_tokens[k] for k in ("input_ids", "attention_mask", "token_type_ids") if k in null_tokens}
+    null_ctx = text_encoder(**null_inputs).last_hidden_state
+    base_null = null_ctx.mean(dim=1, keepdim=True)
+    ctx_uncond = base_null.expand(ctx_cond.size(0), KTOK, base_null.size(-1)).to(device=device, dtype=model_dtype)
 
-	# --- latents ---
-	z = torch.randn((1, 4, 32, 32), device=device, dtype=torch.float32) * float(scheduler.init_noise_sigma)
+    # --- hybrid latent ---
+    B = ctx_cond.size(0)
+    z_random = torch.randn((B, 4, 32, 32), device=device, dtype=torch.float32) * float(scheduler.init_noise_sigma)
+    z_dataset = mean_latent + std_latent * torch.randn_like(mean_latent)
+    z = alpha * z_random + (1 - alpha) * z_dataset
 
-	timesteps = scheduler.timesteps.to(device)
-	if timesteps.numel() > 1 and timesteps[-1] > timesteps[0]:
-		timesteps = timesteps.flip(0)
+    # --- scheduler timesteps ---
+    timesteps = scheduler.timesteps.to(device)
+    if timesteps.numel() > 1 and timesteps[-1] > timesteps[0]:
+        timesteps = timesteps.flip(0)
+    gs = torch.tensor(float(guidance_scale), device=device, dtype=torch.float32)
 
-	# --- inference loop ---
-	for t in timesteps:
-		t_tensor = torch.tensor([t], device=device, dtype=torch.long)
-		z_in = z.to(dtype=model_dtype)
+    # --- diffusion loop ---
+    for t in timesteps:
+        t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
+        z_in = z.to(dtype=model_dtype)
 
-		eps_u = unet(z_in, t_tensor, ctx_uncond).sample.to(torch.float32)
-		eps_c = unet(z_in, t_tensor, ctx_cond).sample.to(torch.float32)
-		eps = eps_u + guidance_scale * (eps_c - eps_u)
+        eps_c = unet(z_in, t_tensor, ctx_cond).sample.to(torch.float32)
+        eps_u = unet(z_in, t_tensor, ctx_uncond).sample.to(torch.float32)
+        eps = eps_u + gs * (eps_c - eps_u)
 
-		z = scheduler.step(model_output=eps, timestep=t, sample=z).prev_sample
-		del z_in, eps_u, eps_c, eps, t_tensor
+        z = scheduler.step(model_output=eps, timestep=t, sample=z).prev_sample
 
-	img = decode_latents(z, vae, scale=scale)[0]
-	img_gray = to_grayscale(img, auto_contrast=True)
-	return img_gray
+    # --- decode ---
+    decoded = decode_latents(z, vae, scale=scale)
+    img_gray = to_grayscale(decoded[0], auto_contrast=True)
+    return img_gray
+
+
 
 # ----------------- Streamlit UI -----------------
-st.title("Shortened Clinical Report → X-ray Image")
+st.title("Clinical Report → X-ray Image")
 
 # Device & hyperparameters
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,24 +209,97 @@ SCALE = 0.18215
 # Load models
 tokenizer, text_encoder, unet, vae, scheduler, null_ctx_cpu = load_models(KTOK=KTOK, device=device)
 
-# Single input for prompt (remove the unused text_area)
-prompt = st.text_input("Enter conditions (comma separated, view last):", "cardiomegaly, edema, view: ap")
-guidance_scale = st.slider("CFG Guidance Scale", min_value=0, max_value=10, value=2, step=1)
 
-if st.button("Generate"):
-	with st.spinner("Generating image..."):
-		img_gray = sample_single(
+guidance_scale = st.slider("CFG Guidance Scale", min_value=0, max_value=10, value=2, step=1)
+alpha = st.slider("Random vs Dataset Similar Latent", min_value=0.0, max_value=1.0, value=1.0, step=0.1)
+
+# Define all possible conditions and views
+conditions = ["atelectasis", "cardiomegaly", "consolidation", "edema", "enlarged cardiomediastinum", "fracture", "lung lesion", "lung opacity", "no finding", "pleural effusion", "pleural other", "pneumonia", "pneumothorax"]
+
+views = ["ap", "ap axial", "ap lld", "ap rld", "lao", "lateral", "ll", "lpo", "nan", "pa", "pa lld", "pa rld", "rao", "swimmers", "xtable lateral", "support devices"]
+
+if "selected_conditions" not in st.session_state:
+	st.session_state.selected_conditions = set()
+
+def toggle_condition(cond):
+	if cond in st.session_state.selected_conditions:
+		st.session_state.selected_conditions.remove(cond)
+	else:
+		st.session_state.selected_conditions.add(cond)
+
+st.markdown("### Conditions")
+# for cond in conditions:
+# 	active = cond in st.session_state.selected_conditions
+# 	if st.button(("✅ " if active else "➕ ") + cond, key=f"cond_{cond}"):
+# 		toggle_condition(cond)
+
+cols_per_row = 4
+for i in range(0, len(conditions), cols_per_row):
+    cols = st.columns(cols_per_row)
+    for j, cond in enumerate(conditions[i:i+cols_per_row]):
+        active = cond in st.session_state.selected_conditions
+        if cols[j].button(("✅ " if active else "➕ ") + cond, key=f"cond_{cond}"):
+            toggle_condition(cond)
+
+selected_view = st.radio("### View", views, index=None, horizontal=True)
+
+# Build report string
+report_parts = []
+if st.session_state.selected_conditions:
+	report_parts.extend(sorted(st.session_state.selected_conditions))
+if selected_view:
+	report_parts.append(f"view: {selected_view.lower()}")
+
+report = ", ".join(report_parts) if report_parts else "no finding"
+
+# baseline report (no conditions, but same view)
+baseline_report = None
+if selected_view:
+	baseline_report = f"no finding, view: {selected_view.lower()}"
+
+# --- Show reports ---
+if report:
+	st.markdown(f"**Conditioned report:** `{report}`")
+if baseline_report:
+	st.markdown(f"**Baseline report:** `{baseline_report}`")
+
+# --- Generate images ---
+if report and baseline_report:
+	col1, col2 = st.columns(2)
+	with col1:
+		st.write("Conditioned")
+		conditioned_img = sample_single(
 			unet=unet,
 			vae=vae,
 			tokenizer=tokenizer,
 			text_encoder=text_encoder,
 			scheduler=scheduler,
 			device=device,
-			prompt=prompt,
+			prompt=report,
+			mean_latent=mean_latent,
+			std_latent=std_latent,
+			alpha=alpha,
 			guidance_scale=guidance_scale,
 			KTOK=KTOK,
 			scale=SCALE
 		)
-	# Convert tensor to numpy for Streamlit
-	img_display = img_gray.permute(1, 2, 0).cpu().numpy()
-	st.image(img_display, caption="Generated Image")
+		st.image(conditioned_img.permute(1, 2, 0).cpu().numpy(), caption=report, width=330)
+
+	with col2:
+		st.write("Baseline")
+		baseline_img = sample_single(
+			unet=unet,
+			vae=vae,
+			tokenizer=tokenizer,
+			text_encoder=text_encoder,
+			scheduler=scheduler,
+			device=device,
+			prompt=baseline_report,
+			mean_latent=mean_latent,
+			std_latent=std_latent,
+			alpha=alpha,
+			guidance_scale=guidance_scale,
+			KTOK=KTOK,
+			scale=SCALE
+		)
+		st.image(baseline_img.permute(1, 2, 0).cpu().numpy(), caption=baseline_report, width=330)

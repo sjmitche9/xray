@@ -13,25 +13,46 @@ from diffusers import UNet2DConditionModel, DDPMScheduler, AutoencoderKL
 from peft import get_peft_model, LoraConfig
 from accelerate import Accelerator
 from pytorch_msssim import ssim
-import math
 import torch.nn as nn
 import torch.nn.functional as F
 
+PROJECT_ROOT = os.path.abspath(os.environ.get("XRAY_PROJECT_ROOT", os.path.dirname(__file__)))
+
 
 def composite_loss(pred, target, ssim_weight=0.0, beta=1.0):
-    # Smooth L1 loss
-    sl1 = F.smooth_l1_loss(pred, target, beta=beta)
+	# Smooth L1 loss
+	sl1 = F.smooth_l1_loss(pred, target, beta=beta)
 
-    # Normalize before SSIM to keep values in [0,1]
-    pred_norm = (pred - pred.min()) / (pred.max() - pred.min() + 1e-5)
-    target_norm = (target - target.min()) / (target.max() - target.min() + 1e-5)
+	# Normalize before SSIM to keep values in [0,1]
+	pred_norm = (pred - pred.min()) / (pred.max() - pred.min() + 1e-5)
+	target_norm = (target - target.min()) / (target.max() - target.min() + 1e-5)
 
-    # SSIM loss
-    ssim_loss = 1.0 - ssim(pred_norm, target_norm, data_range=1.0, size_average=True)
+	# SSIM loss
+	ssim_loss = 1.0 - ssim(pred_norm, target_norm, data_range=1.0, size_average=True)
 
-    # Weighted sum
-    total_loss = sl1 + ssim_weight * ssim_loss
-    return total_loss, sl1.item(), ssim_loss.item()
+	# Weighted sum
+	total_loss = sl1 + ssim_weight * ssim_loss
+	return total_loss, sl1.item(), ssim_loss.item()
+
+
+def _tune_report(
+	*,
+	recon_ssim_mean: float,
+	recon_psnr_mean: float,
+	val_loss: float,
+	epoch: int,
+):
+	try:
+		from ray import tune
+		tune.report({
+			"val_recon_ssim_mean": float(recon_ssim_mean),
+			"val_recon_psnr_mean": float(recon_psnr_mean),
+			"val_loss": float(val_loss),
+			"epoch": int(epoch),
+		})
+	except Exception:
+	    # Safe no-op when not running under Ray Tune
+	    pass
 
 
 # ----------------- helpers -----------------
@@ -255,12 +276,16 @@ class LoRAEMA:
 
 
 # ----------------- checkpoint utils -----------------
-def _preferred_ckpt_dir(root, prefer_best=True):
+def _preferred_ckpt_dir(root, name="", prefer_best=True):
+
 	best = os.path.join(root, "best")
 	if prefer_best and os.path.isdir(best):
 		return best
-	cand = sorted(glob.glob(os.path.join(root, "epoch*")))
-	return cand[-1] if cand else None
+	elif name != "":
+		return os.path.join(root, name)
+	else:
+		cand = sorted(glob.glob(os.path.join(root, "epoch*")))
+		return cand[-1] if cand else None
 
 
 def _optim_hparams(pg):
@@ -276,11 +301,19 @@ def _optim_hparams(pg):
 def _save_checkpoint(accelerator, unet_wrapped, optimizer, lr_scheduler, ema, ckpt_root, epoch, best_val_loss, patience_counter):
 	accelerator.wait_for_everyone()
 	os.makedirs(ckpt_root, exist_ok=True)
-	save_dir = os.path.join(ckpt_root, f"epoch{epoch+1:04d}")
-	os.makedirs(save_dir, exist_ok=True)
+	# save_dir = os.path.join(ckpt_root, f"epoch{epoch+1:04d}")
+	# os.makedirs(save_dir, exist_ok=True)
 
 	unwrapped = accelerator.unwrap_model(unet_wrapped).unet
-	unwrapped.save_pretrained(save_dir)
+
+
+	# After each epoch
+	epoch_folder = os.path.join(ckpt_root, f"epoch{epoch+1:04d}")
+	os.makedirs(epoch_folder, exist_ok=True)
+
+	# Save the full LoRA adapter (all layers included)
+
+	unwrapped.save_pretrained(epoch_folder)
 
 	# also save the wrapper's context_proj weights
 	wrapped = accelerator.unwrap_model(unet_wrapped)
@@ -297,8 +330,8 @@ def _save_checkpoint(accelerator, unet_wrapped, optimizer, lr_scheduler, ema, ck
 		"opt_hparams": [_optim_hparams(pg) for pg in optimizer.param_groups],
 		"context_proj": proj_sd,
 	}
-	torch.save(state, os.path.join(save_dir, "state.pt"))
-	accelerator.print(f"[save] wrote {save_dir}")
+	torch.save(state, os.path.join(epoch_folder, "state.pt"))
+	accelerator.print(f"[save] wrote {epoch_folder}")
 
 
 def _save_best_checkpoint(
@@ -355,8 +388,8 @@ def _identity_init_context_proj(accelerator, unet_wrapped):
 			accelerator.print("[resume] context_proj set to identity (fallback)")
 
 
-def _try_resume(accelerator, unet_wrapped, optimizer, lr_scheduler, ema, ckpt_root, load_opt_state):
-	ckpt_dir = _preferred_ckpt_dir(ckpt_root, prefer_best=True)
+def _try_resume(accelerator, unet_wrapped, optimizer, lr_scheduler, ema, ckpt_root, ckpt_name, load_opt_state):
+	ckpt_dir = _preferred_ckpt_dir(root=ckpt_root, name=ckpt_name, prefer_best=False)
 	if not ckpt_dir:
 		return 0, float("inf"), 0, False, None
 
@@ -452,6 +485,18 @@ def main():
 	with open("config/config.yaml") as f:
 		config = yaml.safe_load(f)
 
+	def _abs(p: str) -> str:
+		if p is None:
+			return p
+		return p if os.path.isabs(p) else os.path.abspath(os.path.join(PROJECT_ROOT, p))
+
+	# normalize important paths
+	config["MODEL"]["VAE_CHECKPOINT"] = _abs(config["MODEL"]["VAE_CHECKPOINT"])
+	config["MODEL"]["LORA_CHECKPOINT"] = _abs(config["MODEL"]["LORA_CHECKPOINT"])
+	config["MODEL"]["DIFFUSION_CHECKPOINT"] = _abs(config["MODEL"]["DIFFUSION_CHECKPOINT"])
+	config["DATASET"]["LATENT_OUTPUT_PATH"] = _abs(config["DATASET"]["LATENT_OUTPUT_PATH"])
+
+
 	accelerator = Accelerator(mixed_precision="bf16")
 	device = accelerator.device
 
@@ -470,6 +515,7 @@ def main():
 	KTOK = int(config["TRAINING"].get("TEXT_TOKENS", 16))
 	p_uncond = float(config["TRAINING"].get("CFG_DROPOUT", .05))
 	ckpt_root = config["MODEL"]["LORA_CHECKPOINT"]
+	ckpt_name = config["MODEL"]["LORA_CHECKPOINT_NAME"]
 	resume_enabled = bool(config["MODEL"].get("LORA_RESUME", False))
 	resume_load_opt = bool(config["MODEL"].get("LORA_RESUME_LOAD_OPT_STATE", False))
 	warmup_epochs = int(config["TRAINING"].get("WARMUP_EPOCHS", 5))
@@ -510,6 +556,7 @@ def main():
 	unet_lora = get_peft_model(unet_base, lora_config)
 	unet = LoRAUNetWrapper(unet_lora, context_dim_in=768, context_dim_out=768).to(device)
 	
+
 
 	# --- identity context_proj if effectively uninitialized ---
 	with torch.no_grad():
@@ -564,6 +611,16 @@ def main():
 	for p in accelerator.unwrap_model(unet).context_proj.parameters():
 		p.requires_grad = True
 
+	for p in accelerator.unwrap_model(unet).unet.mid_block.parameters():
+		p.requires_grad = True
+
+	for p in accelerator.unwrap_model(unet).unet.down_blocks[-1].parameters():
+		p.requires_grad = True
+
+	for p in accelerator.unwrap_model(unet).unet.up_blocks[0].parameters():
+		p.requires_grad = True
+
+
 	# --- split parameter groups: LoRA vs context_proj
 	base = accelerator.unwrap_model(unet)
 	lora_params, ctx_params = [], []
@@ -577,10 +634,27 @@ def main():
 			if "lora" in n.lower():
 				lora_params.append(p)
 
+	all_params = list(unet.parameters())
+
+	# Keep only tensors not in LoRA or context_proj, deduplicated by id
+	lora_ids = set(id(p) for p in lora_params)
+	ctx_ids = set(id(p) for p in ctx_params)
+
+	trainable_params = []
+	seen = set()
+	for p in all_params:
+		pid = id(p)
+		if pid in seen or pid in lora_ids or pid in ctx_ids:
+			continue
+		trainable_params.append(p)
+		seen.add(pid)
+
+
 	optimizer = torch.optim.AdamW(
 		[
 			{"params": lora_params, "lr": float(config["TRAINING"]["LEARNING_RATE"]), "weight_decay": 0.0},
 			{"params": ctx_params,  "lr": 1e-5, "weight_decay": 1e-4},
+			{"params": trainable_params, "lr": float(config["TRAINING"]["LEARNING_RATE"]), "weight_decay": 0.0}
 		],
 		betas=(0.9, 0.999),
 		eps=1e-8,
@@ -606,10 +680,11 @@ def main():
 	# ---- wandb ----
 	wandb.init(project=config["WANDB"]["PROJECT"], name=config["WANDB"]["RUN_NAME_LORA_UNET"], config=config)
 
+
 	# ---- resume (optional) ----
 	if resume_enabled:
 		start_epoch, best_val_loss, patience_counter, ema_ready, ckpt_dir = _try_resume(
-			accelerator, unet, optimizer, lr_scheduler, ema, ckpt_root, load_opt_state=resume_load_opt
+			accelerator, unet, optimizer, lr_scheduler, ema, ckpt_root, ckpt_name, load_opt_state=resume_load_opt
 		)
 		if not resume_load_opt:
 			start_epoch = 0
@@ -622,14 +697,14 @@ def main():
 		ema_ready = True
 
 	accelerator.print("=== run config ===")
-	accelerator.print(f"resume={resume_enabled}  load_opt={resume_load_opt}  ckpt_root={ckpt_root}")
+	accelerator.print(f"resume={resume_enabled}  load_opt={resume_load_opt}  ckpt_root={ckpt_root} ckpt_name={ckpt_name}")
 	if ckpt_dir:
 		accelerator.print(f"[resume] dir={ckpt_dir}")
 	accelerator.print(f"epochs={epochs}  batch_size={batch_size}  lr={optimizer.param_groups[0]['lr']}")
 
 	val_gen = torch.Generator(device=device).manual_seed(42)
 
-	p_noise_max = 0.5
+	p_noise_max = 0.1
 	ramp_frac = 0.6                # ramp over first 60% of epochs, then hold at p_noise_max
 
 
@@ -991,6 +1066,17 @@ def main():
 		avg_val_pred_std = val_pred_std_sum / max(1, val_batches) if val_batches else 0.0
 		avg_val_cos = val_cos_sum / max(1, val_batches) if val_batches else 0.0
 
+		recon_ssim_mean = (sum(pair_ssims) / len(pair_ssims)) if pair_ssims else 0.0
+		recon_psnr_mean = (sum(pair_psnrs) / len(pair_psnrs)) if pair_psnrs else 0.0
+
+		_tune_report(
+				recon_ssim_mean=recon_ssim_mean,
+				recon_psnr_mean=recon_psnr_mean,
+				val_loss=avg_val_loss,
+				epoch=epoch + 1,
+			)
+
+
 		def _mean_p95(xs):
 			if not xs:
 				return 0.0, 0.0
@@ -1032,6 +1118,7 @@ def main():
 		}
 		log_data["train/lr_ctx"]  = optimizer.param_groups[1]["lr"]
 		log_data["train/lr_lora"] = optimizer.param_groups[0]["lr"]
+		log_data["train/lr_unet"] = optimizer.param_groups[2]["lr"]
 		log_data.update(cfg_log)
 		wandb.log(log_data)
 		accelerator.print(f"[val]   epoch {epoch+1}: avg_val_loss={avg_val_loss:.5f} used_ema={used_ema}")
