@@ -110,12 +110,12 @@ if __name__ == "__main__":
     )
 
     tuner = tune.Tuner(
-        tune.with_resources(trainable, resources={"cpu": 16, "gpu": 1}),
+        tune.with_resources(trainable, resources={"cpu": 12, "gpu": 1}),
         param_space=param_space,
         tune_config=tune.TuneConfig(
             search_alg=search_alg,     # <-- this is the missing piece
             scheduler=scheduler,
-            num_samples=50,             # <-- >1 so you actually test Optuna suggestions
+            num_samples=2,             # <-- >1 so you actually test Optuna suggestions
             trial_dirname_creator=trial_dirname_creator
         ),
         run_config=tune.RunConfig(

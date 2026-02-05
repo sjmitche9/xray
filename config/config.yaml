@@ -33,10 +33,10 @@ MODEL:
 
 # training config
 TRAINING:
-  BATCH_SIZE: 1
+  BATCH_SIZE: 8
   GRAD_ACCUM_STEPS: 128
   MAX_GRAD_NORM: 1.0
-  EPOCHS: 2
+  EPOCHS: 5
   LEARNING_RATE: 2e-5
   TEXT_TOKENS: 16 # this is now saved with the latent dataset
   LORA_R: 64
@@ -52,7 +52,7 @@ TRAINING:
   EARLY_STOP_PATIENCE: 100
   MIN_SAVE_EPOCH: 3
   TRAIN_ON_THREE_BATCHES: false # use this for debugging
-  CHUNK_LIMIT: 36 # this limits the number of chunks loaded and trained on (max 36)
+  CHUNK_LIMIT: 10 # this limits the number of chunks loaded and trained on (max 36)
 
   LR_SCHEDULER:
     TYPE: "ReduceLROnPlateau"
