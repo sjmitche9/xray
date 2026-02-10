@@ -91,7 +91,7 @@ if __name__ == "__main__":
 
         # budget knobs fixed for debug
         "epochs": 100,
-        "chunk_limit": 36,
+        "chunk_limit": 10,
     }
 
     # With epochs=2, ASHA isn't very meaningful but is fine for wiring debug.
@@ -110,7 +110,7 @@ if __name__ == "__main__":
     )
 
     tuner = tune.Tuner(
-        tune.with_resources(trainable, resources={"cpu": 12, "gpu": 1}),
+        tune.with_resources(trainable, resources={"cpu": 16, "gpu": 1}),
         param_space=param_space,
         tune_config=tune.TuneConfig(
             search_alg=search_alg,     # <-- this is the missing piece
