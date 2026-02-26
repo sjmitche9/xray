@@ -13,7 +13,7 @@ evaluate
 rouge-score
 absl-py
 h5py
-# ray # whl must be downloaded and installed for windows and python version
+ray[tune]==2.43.0
 scikit-image
 pytorch-msssim
 diffusers

@@ -34,9 +34,9 @@ MODEL:
 # training config
 TRAINING:
   BATCH_SIZE: 8
-  GRAD_ACCUM_STEPS: 128
+  GRAD_ACCUM_STEPS: 16
   MAX_GRAD_NORM: 1.0
-  EPOCHS: 5
+  EPOCHS: 50
   LEARNING_RATE: 2e-5
   TEXT_TOKENS: 16 # this is now saved with the latent dataset
   LORA_R: 64
