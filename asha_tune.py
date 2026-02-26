@@ -158,7 +158,7 @@ if __name__ == "__main__":
         "lora_dropout": tune.uniform(0.0, 0.15),
         "cfg_dropout": tune.uniform(0.0, 0.10),
         "beta": tune.uniform(0.8, 1.2),
-        "ssim_weight": tune.uniform(0.0, 0.12),
+        # "ssim_weight": tune.uniform(0.0, 0.12),
         "epochs": 35,
         "chunk_limit": 10,
 }

@@ -21,20 +21,20 @@ import torch.nn.functional as F
 PROJECT_ROOT = os.path.abspath(os.environ.get("XRAY_PROJECT_ROOT", os.path.dirname(__file__)))
 
 
-def composite_loss(pred, target, ssim_weight=0.0, beta=1.0):
-	# Smooth L1 loss
-	sl1 = F.smooth_l1_loss(pred, target, beta=beta)
+def composite_loss_tune(pred, target, ssim_weight=0.0, beta=1.0):
+    sl1 = F.smooth_l1_loss(pred, target, beta=beta)
 
-	# Normalize before SSIM to keep values in [0,1]
-	pred_norm = (pred - pred.min()) / (pred.max() - pred.min() + 1e-5)
-	target_norm = (target - target.min()) / (target.max() - target.min() + 1e-5)
+    if ssim_weight <= 0.0:
+        # skip all SSIM math entirely
+        return sl1, float(sl1.item()), 0.0
 
-	# SSIM loss
-	ssim_loss = 1.0 - ssim(pred_norm, target_norm, data_range=1.0, size_average=True)
+    # Normalize before SSIM to keep values in [0,1]
+    pred_norm = (pred - pred.amin()) / (pred.amax() - pred.amin() + 1e-5)
+    target_norm = (target - target.amin()) / (target.amax() - target.amin() + 1e-5)
 
-	# Weighted sum
-	total_loss = sl1 + ssim_weight * ssim_loss
-	return total_loss, sl1.item(), ssim_loss.item()
+    ssim_loss = 1.0 - ssim(pred_norm, target_norm, data_range=1.0, size_average=True)
+    total = sl1 + ssim_weight * ssim_loss
+    return total, float(sl1.item()), float(ssim_loss.item())
 
 
 def _tune_report(
@@ -608,6 +608,10 @@ def main():
 	)
 
 	unet_lora = get_peft_model(unet_base, lora_config)
+	lora_names = [n for n, _ in unet_lora.named_parameters() if "lora" in n.lower()]
+	print("Total LoRA tensors:", len(lora_names))
+
+
 	unet = LoRAUNetWrapper(unet_lora, context_dim_in=768, context_dim_out=768).to(device)
 
 	# ---- Freeze everything except LoRA adapters + context_proj ----
@@ -818,8 +822,6 @@ def main():
 				prefetch_factor=prefetch_factor if num_workers > 0 else None,
 			)
 			loader = accelerator.prepare(loader)
-			print(train_on_three)
-			train_on_three = True
 
 			for i, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch+1} Chunk {chunk_id}", ascii=True)):
 				if train_on_three and i == 3:
@@ -895,6 +897,7 @@ def main():
 
 					pred = unet(z_noisy, t, ctx_train).sample
 					loss, _, _ = composite_loss(pred, noise, ssim_weight=ssim_weight, beta=beta)
+
 					loss /= grad_accum_steps
 
 				accelerator.backward(loss)
