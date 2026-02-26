@@ -566,7 +566,6 @@ def main():
 		if "RUN_PREVIEWS_EVERY" not in config.get("TRAINING", {}):
 			RUN_PREVIEWS_EVERY = 0
 
-	os.environ["WANDB_API_KEY"] = "_NTOQcXEGZ5S13xv1dulInjd3vvD_lKP9pfTtb1KM1Fp8CcWyeYokY7COQHPaYSH6od45WwV3eL17Y"
 
 	# Dataloader worker knobs (define ONCE; used for train + val)
 	num_workers = int(config.get("DATASET", {}).get("NUM_WORKERS", 14))
